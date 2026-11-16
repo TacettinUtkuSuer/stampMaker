@@ -1,0 +1,972 @@
+<!DOCTYPE html>
+<html lang="tr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Soğuk Damga Kalıp Oluşturucu</title>
+<meta name="description" content="SVG'den 3D yazıcıda basılabilir soğuk damga (embossing) erkek/dişi kalıp STL oluşturucu.">
+<style>
+  :root {
+    --bg: #0f1216; --panel: #161a20; --panel2: #1c2129; --line: #2a313c;
+    --text: #e6e9ee; --muted: #93a0b0; --accent: #4f8cff; --male: #5b8def; --female: #f0a43a;
+    --ok: #3ccf7a; --warn: #f2b84b; --err: #ff5d5d;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; }
+  body {
+    display: flex; overflow: hidden; background: var(--bg); color: var(--text);
+    font: 13px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  #panel {
+    width: 360px; flex: none; overflow-y: auto; background: var(--panel);
+    border-right: 1px solid var(--line); padding: 14px 14px 24px;
+  }
+  #panel h1 { font-size: 16px; margin: 0 0 2px; }
+  #panel .sub { color: var(--muted); font-size: 12px; margin-bottom: 12px; }
+  details { background: var(--panel2); border: 1px solid var(--line); border-radius: 8px; margin-bottom: 10px; }
+  summary { cursor: pointer; padding: 9px 12px; font-weight: 600; user-select: none; }
+  details > .body { padding: 2px 12px 10px; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
+  .row label { flex: 1; color: #c9d1db; }
+  .row label small { display: block; color: var(--muted); font-size: 11px; }
+  .row input[type=number] {
+    width: 78px; padding: 5px 6px; background: #0e1116; color: var(--text);
+    border: 1px solid var(--line); border-radius: 5px; font: inherit; text-align: right;
+  }
+  .row input[type=number]:focus { outline: none; border-color: var(--accent); }
+  .row .unit { width: 22px; color: var(--muted); font-size: 11px; }
+  .row input[type=checkbox] { width: 16px; height: 16px; accent-color: var(--accent); }
+  .file { display: block; margin: 8px 0; }
+  .file input { width: 100%; color: var(--muted); font-size: 12px; }
+  .btns { display: flex; gap: 6px; flex-wrap: wrap; margin: 6px 0; }
+  button {
+    background: #252c37; color: var(--text); border: 1px solid var(--line); border-radius: 6px;
+    padding: 6px 10px; font: inherit; cursor: pointer;
+  }
+  button:hover { border-color: #3a4454; background: #2b3340; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+  button.primary:hover { filter: brightness(1.1); }
+  button.dl-male { background: #2a4a8a; border-color: var(--male); }
+  button.dl-female { background: #7a5214; border-color: var(--female); }
+  .filename { color: var(--muted); font-size: 11px; word-break: break-all; }
+  #warnings { margin-top: 10px; }
+  .msg { border-radius: 6px; padding: 7px 9px; margin: 6px 0; font-size: 12px; border: 1px solid; }
+  .msg.warn { background: #2b2414; border-color: #5a4518; color: #f4d58e; }
+  .msg.err { background: #2c1616; border-color: #6a2424; color: #ffb0b0; }
+  .msg.ok { background: #13281c; border-color: #1f5133; color: #a7e8c1; }
+  .info { color: var(--muted); font-size: 12px; margin-top: 8px; }
+  .info b { color: var(--text); font-weight: 600; }
+
+  #view { flex: 1; position: relative; min-width: 0; }
+  #view canvas { display: block; width: 100%; height: 100%; }
+  .overlay { position: absolute; pointer-events: none; }
+  .overlay > * { pointer-events: auto; }
+  #topbar { top: 12px; left: 12px; right: 12px; display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; align-items: flex-start; }
+  .seg { display: inline-flex; background: rgba(22,26,32,.92); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+  .seg button { border: 0; border-radius: 0; background: transparent; padding: 8px 12px; }
+  .seg button.active { background: var(--accent); color: #fff; }
+  .card { background: rgba(22,26,32,.92); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; }
+  #dlbar { display: flex; gap: 6px; flex-wrap: wrap; }
+  #viewopts { top: 60px; left: 12px; display: none; flex-direction: column; gap: 6px; min-width: 240px; }
+  #viewopts .row { margin: 2px 0; }
+  #viewopts input[type=range] { flex: 1; accent-color: var(--accent); }
+  #viewopts .val { width: 52px; text-align: right; color: var(--muted); font-variant-numeric: tabular-nums; }
+  #status { left: 12px; bottom: 12px; font-size: 12px; max-width: calc(100% - 24px); }
+  #status .part { display: flex; gap: 8px; align-items: center; }
+  .dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex: none; }
+  .good { color: var(--ok); } .bad { color: var(--err); }
+  #busy { right: 12px; bottom: 12px; color: var(--muted); font-size: 12px; display: none; }
+
+  @media (max-width: 820px) {
+    body { flex-direction: column-reverse; }
+    #panel { width: auto; height: 48vh; border-right: 0; border-top: 1px solid var(--line); }
+    #view { height: 52vh; flex: none; }
+    .seg button { padding: 7px 8px; font-size: 12px; }
+  }
+</style>
+<script src="https://cdn.jsdelivr.net/npm/clipper-lib@6.4.2/clipper.js"></script>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+
+<aside id="panel">
+  <h1>Soğuk Damga Kalıp Oluşturucu</h1>
+  <div class="sub">SVG → Erkek (alt) + Dişi (üst) kalıp · El tulumba presi · STL (mm)</div>
+  <div id="sections"></div>
+  <div class="btns">
+    <button class="primary dl-male" data-dl="male">⬇ Alt Kalıp (.STL) İndir</button>
+    <button class="primary dl-female" data-dl="female">⬇ Üst Kalıp (.STL) İndir</button>
+  </div>
+  <div id="info" class="info"></div>
+  <div id="warnings"></div>
+</aside>
+
+<main id="view">
+  <div id="topbar" class="overlay">
+    <div class="seg" id="modes">
+      <button data-mode="0" class="active">Yan Yana Baskı</button>
+      <button data-mode="1">Hizalama / Montaj</button>
+      <button data-mode="2">Kesit / Tel Kafes</button>
+    </div>
+    <div id="dlbar">
+      <button class="primary dl-male" data-dl="male">⬇ Alt Kalıp (.STL)</button>
+      <button class="primary dl-female" data-dl="female">⬇ Üst Kalıp (.STL)</button>
+      <button id="resetView" title="Kamerayı sıfırla">⟲ Görünüm</button>
+    </div>
+  </div>
+  <div id="viewopts" class="overlay card">
+    <div class="row" id="optOpen"><label>Kalıp açıklığı</label><input type="range" id="openRange" min="0" max="25" step="0.1" value="0"><span class="val" id="openVal">0 mm</span></div>
+    <div class="row" id="optCut"><label>Kesit kaydır</label><input type="range" id="cutRange" min="-25" max="25" step="0.1" value="0"><span class="val" id="cutVal">0 mm</span></div>
+    <div class="row" id="optWire"><label>Tel kafes katmanı</label><input type="checkbox" id="wireChk" checked></div>
+    <div class="row" id="optHint" style="color:var(--muted);font-size:11px;max-width:260px"></div>
+  </div>
+  <div id="status" class="overlay card"></div>
+  <div id="busy" class="overlay card">Hesaplanıyor…</div>
+</main>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { SVGLoader } from 'three/addons/loaders/SVGLoader.js';
+import { STLExporter } from 'three/addons/exporters/STLExporter.js';
+import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js';
+
+/* =====================================================================
+   0) SABİTLER / YARDIMCILAR
+   Tüm 2D geometri Clipper tamsayı uzayında tutulur: 1 birim = 1 µm.
+   Böylece katmanlar arasındaki ortak kenarlar bit-bit aynı köşelere
+   sahip olur ve tek parça, su geçirmez (manifold) bir ağ örülebilir.
+   ===================================================================== */
+const CL = window.ClipperLib;
+const S = 1000;                       // mm → birim
+const U = mm => Math.round(mm * S);
+const NZ = CL.PolyFillType.pftNonZero;
+const EO = CL.PolyFillType.pftEvenOdd;
+
+const pt = (x, y) => ({ X: U(x), Y: U(y) });
+function signedArea(p) {
+  let a = 0;
+  for (let i = 0, n = p.length; i < n; i++) {
+    const q = p[i], r = p[(i + 1) % n];
+    a += q.X * r.Y - r.X * q.Y;
+  }
+  return a / 2;
+}
+function circle(cx, cy, r, n, circumscribed = false) {
+  const R = circumscribed ? r / Math.cos(Math.PI / n) : r;
+  const out = [];
+  for (let i = 0; i < n; i++) {
+    const a = 2 * Math.PI * i / n;
+    out.push(pt(cx + R * Math.cos(a), cy + R * Math.sin(a)));
+  }
+  return out;
+}
+const rect = (x0, y0, x1, y1) => [pt(x0, y0), pt(x1, y0), pt(x1, y1), pt(x0, y1)];
+function hexagon(cx, cy, acrossFlats) {
+  const R = acrossFlats / Math.sqrt(3);
+  const out = [];
+  for (let i = 0; i < 6; i++) { const a = Math.PI / 3 * i; out.push(pt(cx + R * Math.cos(a), cy + R * Math.sin(a))); }
+  return out;
+}
+
+/* ---------- Clipper sarmalayıcıları ---------- */
+function clipOp(type, subj, clp, fill = NZ, asTree = false) {
+  const c = new CL.Clipper();
+  c.PreserveCollinear = true;
+  c.StrictlySimple = true;
+  const ok = p => p && p.length >= 3;
+  c.AddPaths(subj.filter(ok), CL.PolyType.ptSubject, true);
+  if (clp && clp.length) c.AddPaths(clp.filter(ok), CL.PolyType.ptClip, true);
+  const out = asTree ? new CL.PolyTree() : new CL.Paths();
+  c.Execute(type, out, fill, fill);
+  return out;
+}
+// PolyTree → [{outer, holes[]}]
+function treeShapes(tree) {
+  const res = [];
+  const walk = node => {
+    for (const outerNode of node.Childs()) {
+      const holes = [];
+      for (const h of outerNode.Childs()) { holes.push(h.Contour()); walk(h); }
+      res.push({ outer: outerNode.Contour(), holes });
+    }
+  };
+  walk(tree);
+  return res;
+}
+// Şekiller → yönlendirilmiş düz yol listesi (dış: CCW, delik: CW)
+function shapesToPaths(shapes, minArea = 0) {
+  const out = [];
+  for (const s of shapes) {
+    let o = s.outer;
+    const ao = signedArea(o);
+    if (Math.abs(ao) <= minArea) continue;
+    if (ao < 0) o = o.slice().reverse();
+    out.push(o);
+    for (let h of s.holes) {
+      const ah = signedArea(h);
+      if (Math.abs(ah) <= minArea) continue;
+      if (ah > 0) h = h.slice().reverse();
+      out.push(h);
+    }
+  }
+  return out;
+}
+const region = (paths, minArea = 0) =>
+  shapesToPaths(treeShapes(clipOp(CL.ClipType.ctUnion, paths, null, NZ, true)), minArea);
+const difference = (a, b) =>
+  shapesToPaths(treeShapes(clipOp(CL.ClipType.ctDifference, a, b, NZ, true)));
+function totalAreaMM2(paths) { let a = 0; for (const p of paths) a += signedArea(p); return Math.abs(a) / (S * S); }
+const interArea = (a, b) => (a.length && b.length) ? totalAreaMM2(clipOp(CL.ClipType.ctIntersection, a, b)) : 0;
+const diffArea = (a, b) => a.length ? totalAreaMM2(clipOp(CL.ClipType.ctDifference, a, b)) : 0;
+function offsetPaths(paths, deltaUnits) {
+  if (!paths.length) return [];
+  if (deltaUnits === 0) return paths.map(p => p.slice());
+  const co = new CL.ClipperOffset(2, S * 0.005);
+  co.AddPaths(paths, CL.JoinType.jtRound, CL.EndType.etClosedPolygon);
+  const out = new CL.Paths();
+  co.Execute(out, deltaUnits);
+  return region(out);
+}
+function bounds(paths) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const p of paths) for (const q of p) {
+    if (q.X < x0) x0 = q.X; if (q.X > x1) x1 = q.X;
+    if (q.Y < y0) y0 = q.Y; if (q.Y > y1) y1 = q.Y;
+  }
+  return { x0, y0, x1, y1 };
+}
+
+/* =====================================================================
+   1) KATMANLI KATI GÖVDE (Layered extrusion → tek manifold ağ)
+   Her katman: z0..z1 aralığında, alt/üst konturları verilen bir prizma
+   (pah için alt ve üst konturu farklı "kesik koni" de olabilir).
+   - Yan duvarlar her kontur için örülür.
+   - Katman geçişlerinde yatay yüzeyler = bölge farkları (A\B yukarı,
+     B\A aşağı bakar) ve THREE.ShapeUtils.triangulateShape (Shape+holes
+     earcut) ile üçgenlenir.
+   - Köşeler tamsayı (x,y,z) anahtarıyla kaynaştırılır, T-kavşakları
+     onarılır → her kenar tam 2 üçgen tarafından, ters yönde paylaşılır.
+   ===================================================================== */
+function prism(z0, z1, paths) { return { z0, z1, bot: paths, top: paths }; }
+
+function buildSolid(layers, mirrorYUnits = null) {
+  layers = layers.filter(l => l.z1 > l.z0 && l.bot.length);
+  const pos = [];
+  const vmap = new Map();
+  let tris = [];
+  const V = (x, y, z) => {
+    const k = x + ',' + y + ',' + z;
+    let i = vmap.get(k);
+    if (i === undefined) { i = pos.length / 3; pos.push(x, y, z); vmap.set(k, i); }
+    return i;
+  };
+  const T = (a, b, c) => { if (a !== b && b !== c && a !== c) tris.push([a, b, c]); };
+
+  // Yan duvarlar
+  for (const L of layers) {
+    for (let c = 0; c < L.bot.length; c++) {
+      const pb = L.bot[c], ptp = L.top[c], n = pb.length;
+      for (let i = 0; i < n; i++) {
+        const j = (i + 1) % n;
+        const a = V(pb[i].X, pb[i].Y, L.z0), b = V(pb[j].X, pb[j].Y, L.z0);
+        const cc = V(ptp[j].X, ptp[j].Y, L.z1), d = V(ptp[i].X, ptp[i].Y, L.z1);
+        T(a, b, cc); T(a, cc, d);
+      }
+    }
+  }
+  // Yatay yüzeyler
+  const addCap = (shapes, z, up) => {
+    for (const sh of shapes) {
+      if (sh.outer.length < 3) continue;
+      const contour = sh.outer.map(p => new THREE.Vector2(p.X, p.Y));
+      const holes = sh.holes.filter(h => h.length >= 3).map(h => h.map(p => new THREE.Vector2(p.X, p.Y)));
+      const faces = THREE.ShapeUtils.triangulateShape(contour, holes);
+      const all = contour.concat(...holes);
+      const ids = all.map(p => V(p.x, p.y, z));
+      let sum = 0;
+      for (const f of faces) {
+        const A = all[f[0]], B = all[f[1]], C = all[f[2]];
+        sum += (B.x - A.x) * (C.y - A.y) - (B.y - A.y) * (C.x - A.x);
+      }
+      const flip = up ? sum < 0 : sum > 0;
+      for (const f of faces) {
+        if (flip) T(ids[f[0]], ids[f[2]], ids[f[1]]);
+        else T(ids[f[0]], ids[f[1]], ids[f[2]]);
+      }
+    }
+  };
+  const first = layers[0], last = layers[layers.length - 1];
+  addCap(treeShapes(clipOp(CL.ClipType.ctUnion, first.bot, null, NZ, true)), first.z0, false);
+  for (let i = 0; i + 1 < layers.length; i++) {
+    const A = layers[i].top, B = layers[i + 1].bot, z = layers[i].z1;
+    addCap(treeShapes(clipOp(CL.ClipType.ctDifference, A, B, NZ, true)), z, true);
+    addCap(treeShapes(clipOp(CL.ClipType.ctDifference, B, A, NZ, true)), z, false);
+  }
+  addCap(treeShapes(clipOp(CL.ClipType.ctUnion, last.top, null, NZ, true)), last.z1, true);
+
+  tris = repairTJunctions(pos, tris);
+  const bad = countBadEdges(tris);
+
+  // Çıkış (mm), isteğe bağlı Y aynalama (üst kalıbın baskı yönü için)
+  const P = new Float32Array(pos.length);
+  for (let i = 0; i < pos.length; i += 3) {
+    P[i] = pos[i] / S;
+    P[i + 1] = (mirrorYUnits !== null ? mirrorYUnits - pos[i + 1] : pos[i + 1]) / S;
+    P[i + 2] = pos[i + 2] / S;
+  }
+  const I = new Uint32Array(tris.length * 3);
+  for (let i = 0; i < tris.length; i++) {
+    const t = tris[i];
+    if (mirrorYUnits !== null) { I[i * 3] = t[0]; I[i * 3 + 1] = t[2]; I[i * 3 + 2] = t[1]; }
+    else { I[i * 3] = t[0]; I[i * 3 + 1] = t[1]; I[i * 3 + 2] = t[2]; }
+  }
+  return { pos: P, idx: I, triCount: tris.length, badEdges: bad };
+}
+
+const EK = 4194304; // kenar anahtarı çarpanı (2^22)
+function repairTJunctions(pos, tris) {
+  const EPS = 2, CELL = 1000;
+  for (let iter = 0; iter < 16; iter++) {
+    const cnt = new Map();
+    const key = (a, b) => a < b ? a * EK + b : b * EK + a;
+    for (const t of tris) for (let s = 0; s < 3; s++) {
+      const k = key(t[s], t[(s + 1) % 3]);
+      cnt.set(k, (cnt.get(k) || 0) + 1);
+    }
+    const open = [];
+    const vs = new Set();
+    for (let i = 0; i < tris.length; i++) {
+      const t = tris[i];
+      for (let s = 0; s < 3; s++) {
+        if (cnt.get(key(t[s], t[(s + 1) % 3])) === 1) { open.push(i, s); vs.add(t[s]); vs.add(t[(s + 1) % 3]); }
+      }
+    }
+    if (!open.length) break;
+    const grid = new Map();
+    const ck = (cx, cy) => (cx + 50000) * 100000 + (cy + 50000);
+    for (const v of vs) {
+      const k = ck(Math.floor(pos[v * 3] / CELL), Math.floor(pos[v * 3 + 1] / CELL));
+      let arr = grid.get(k); if (!arr) grid.set(k, arr = []); arr.push(v);
+    }
+    const modified = new Set();
+    const added = [];
+    for (let o = 0; o < open.length; o += 2) {
+      const ti = open[o], s = open[o + 1];
+      if (modified.has(ti)) continue;
+      const t = tris[ti];
+      const a = t[s], b = t[(s + 1) % 3], c = t[(s + 2) % 3];
+      const ax = pos[a * 3], ay = pos[a * 3 + 1], az = pos[a * 3 + 2];
+      const dx = pos[b * 3] - ax, dy = pos[b * 3 + 1] - ay, dz = pos[b * 3 + 2] - az;
+      const len2 = dx * dx + dy * dy + dz * dz;
+      if (!len2) continue;
+      const cx0 = Math.floor((Math.min(ax, ax + dx) - EPS) / CELL), cx1 = Math.floor((Math.max(ax, ax + dx) + EPS) / CELL);
+      const cy0 = Math.floor((Math.min(ay, ay + dy) - EPS) / CELL), cy1 = Math.floor((Math.max(ay, ay + dy) + EPS) / CELL);
+      const hits = [];
+      for (let cx = cx0; cx <= cx1; cx++) for (let cy = cy0; cy <= cy1; cy++) {
+        const arr = grid.get(ck(cx, cy)); if (!arr) continue;
+        for (const v of arr) {
+          if (v === a || v === b) continue;
+          const vx = pos[v * 3] - ax, vy = pos[v * 3 + 1] - ay, vz = pos[v * 3 + 2] - az;
+          const tp = (vx * dx + vy * dy + vz * dz) / len2;
+          if (tp <= 1e-9 || tp >= 1 - 1e-9) continue;
+          const ex = vx - dx * tp, ey = vy - dy * tp, ez = vz - dz * tp;
+          if (ex * ex + ey * ey + ez * ez <= EPS * EPS) hits.push([tp, v]);
+        }
+      }
+      if (!hits.length) continue;
+      hits.sort((p, q) => p[0] - q[0]);
+      modified.add(ti);
+      const seq = [a, ...hits.map(h => h[1]), b];
+      for (let k = 0; k + 1 < seq.length; k++) added.push([seq[k], seq[k + 1], c]);
+    }
+    if (!modified.size) break;
+    const next = [];
+    for (let i = 0; i < tris.length; i++) if (!modified.has(i)) next.push(tris[i]);
+    for (const t of added) next.push(t);
+    tris = next;
+  }
+  return tris;
+}
+function countBadEdges(tris) {
+  const dir = new Map();
+  for (const t of tris) for (let s = 0; s < 3; s++) {
+    const k = t[s] * EK + t[(s + 1) % 3];
+    dir.set(k, (dir.get(k) || 0) + 1);
+  }
+  let bad = 0;
+  for (const [k, c] of dir) {
+    const a = Math.floor(k / EK), b = k - a * EK;
+    if (c !== 1 || dir.get(b * EK + a) !== 1) bad++;
+  }
+  return bad;
+}
+
+/* =====================================================================
+   2) SVG → 2D BÖLGE (SVGLoader + Clipper)
+   Boyacı algoritması: koyu dolgu/çizgi = ekle, açık (beyaz) = çıkar.
+   fill-rule (nonzero/evenodd) ve stroke-width desteklenir.
+   ===================================================================== */
+function isDarkColor(str, fallback) {
+  try {
+    const c = new THREE.Color();
+    if (fallback && fallback.isColor) c.copy(fallback); else c.setStyle(str);
+    const s = c.clone().convertLinearToSRGB();
+    return (0.2126 * s.r + 0.7152 * s.g + 0.0722 * s.b) < 0.5;
+  } catch (e) { return true; }
+}
+function parseSVG(text) {
+  const data = new SVGLoader().parse(text);
+  const items = [];
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const path of data.paths) {
+    const st = (path.userData && path.userData.style) || {};
+    if (st.display === 'none' || st.visibility === 'hidden') continue;
+    const subs = path.subPaths.map(sp => {
+      const pts = sp.getPoints(24).map(p => ({ x: p.x, y: p.y }));
+      return { pts, closed: !!sp.autoClose || (pts.length > 2 && Math.hypot(pts[0].x - pts[pts.length - 1].x, pts[0].y - pts[pts.length - 1].y) < 1e-9) };
+    }).filter(s => s.pts.length >= 2);
+    if (!subs.length) continue;
+    for (const s of subs) for (const p of s.pts) {
+      if (p.x < x0) x0 = p.x; if (p.x > x1) x1 = p.x;
+      if (p.y < y0) y0 = p.y; if (p.y > y1) y1 = p.y;
+    }
+    const op = (st.opacity ?? 1);
+    const fillOn = st.fill && st.fill !== 'none' && st.fill !== 'transparent' && (st.fillOpacity ?? 1) > 0 && op > 0;
+    if (fillOn) items.push({ type: 'fill', subs, evenodd: st.fillRule === 'evenodd', dark: isDarkColor(st.fill, path.color) });
+    const sw = parseFloat(st.strokeWidth);
+    const strokeOn = st.stroke && st.stroke !== 'none' && st.stroke !== 'transparent' && sw > 0 && (st.strokeOpacity ?? 1) > 0 && op > 0;
+    if (strokeOn) items.push({ type: 'stroke', subs, width: sw, dark: isDarkColor(st.stroke), join: st.strokeLineJoin, cap: st.strokeLineCap });
+  }
+  if (!items.length || !isFinite(x0)) throw new Error('SVG içinde dolgulu/çizgili bir yol bulunamadı.');
+  const span = Math.max(x1 - x0, y1 - y0) || 1;
+  const R = 100000 / span;   // geçici tamsayı uzayı
+  const toInt = p => ({ X: Math.round((p.x - x0) * R), Y: Math.round(-(p.y - y0) * R) }); // SVG Y aşağı → yukarı
+
+  let acc = [];
+  for (const it of items) {
+    let reg;
+    if (it.type === 'fill') {
+      const polys = it.subs.map(s => s.pts.map(toInt)).filter(p => p.length >= 3);
+      if (!polys.length) continue;
+      reg = clipOp(CL.ClipType.ctUnion, polys, null, it.evenodd ? EO : NZ);
+    } else {
+      const co = new CL.ClipperOffset(4, 0.25 * 100);
+      const jt = it.join === 'round' ? CL.JoinType.jtRound : (it.join === 'bevel' ? CL.JoinType.jtSquare : CL.JoinType.jtMiter);
+      for (const s of it.subs) {
+        const p = s.pts.map(toInt);
+        const et = s.closed ? CL.EndType.etClosedLine : (it.cap === 'round' ? CL.EndType.etOpenRound : it.cap === 'square' ? CL.EndType.etOpenSquare : CL.EndType.etOpenButt);
+        co.AddPath(p, jt, et);
+      }
+      reg = new CL.Paths();
+      co.Execute(reg, it.width / 2 * R);
+    }
+    acc = it.dark
+      ? clipOp(CL.ClipType.ctUnion, acc.concat(reg), null, NZ)
+      : clipOp(CL.ClipType.ctDifference, acc, reg, NZ);
+  }
+  acc = CL.Clipper.CleanPolygons(acc, 1.5);
+  acc = region(acc, 100000 * 100000 * 1e-6);
+  if (!acc.length) throw new Error('SVG koyu (siyah) bir alan içermiyor.');
+  const b = bounds(acc);
+  return { paths: acc, b, aspect: (b.y1 - b.y0) / (b.x1 - b.x0) };
+}
+
+// Ham SVG bölgesini kalıp üzerindeki mm konumuna yerleştir
+function placeDesign(raw, P) {
+  const { b } = raw;
+  const k = (P.designW * S) / (b.x1 - b.x0);
+  const ox = P.wallT + P.designX, oy = P.wallT + P.designY;
+  const paths = raw.paths.map(p => {
+    const q = p.map(v => ({
+      X: Math.round(ox * S + (P.mirror ? (b.x1 - v.X) : (v.X - b.x0)) * k),
+      Y: Math.round(oy * S + (v.Y - b.y0) * k)
+    }));
+    return P.mirror ? q.reverse() : q;
+  });
+  const cleaned = CL.Clipper.CleanPolygons(paths, 1);
+  return { paths: region(cleaned, 0.005 * S * S), w: P.designW, h: (b.y1 - b.y0) * k / S };
+}
+
+/* =====================================================================
+   3) KALIP GEOMETRİLERİ
+   Koordinatlar: taban plakasının sol-alt köşesi (0,0). L-dayama sol (x=0)
+   ve alt (y=0) kenarlarda. Z yukarı, Z=0 baskı tablası.
+   ===================================================================== */
+function layout(P) {
+  const W = P.baseW, L = P.baseL, t = P.wallT, g = P.upperGap;
+  const fx0 = t + g, fy0 = t + g, fx1 = W - t - g, fy1 = L - t - g; // üst kalıp ayak izi (merkezli)
+  const holeD = P.guideD + P.pinTol;
+  const m = holeD / 2 + 2.0;     // delik çevresinde ≥2 mm et
+  const pins = [{ x: fx0 + m, y: fy1 - m }, { x: fx1 - m, y: fy0 + m }]; // karşılıklı 2 köşe
+  return { W, L, t, g, fx0, fy0, fx1, fy1, holeD, m, pins, cx: W / 2, cy: L / 2 };
+}
+
+function buildMale(P, design, G) {
+  const layers = [];
+  const zPin = U(P.pressPinL), zTop = zPin + U(P.plateT);
+  // 1) Pres pimi (Z=0'dan yukarı)
+  layers.push(prism(0, zPin, region([circle(G.cx, G.cy, P.pressPinD / 2, 96)])));
+  // 2) Taban plakası
+  layers.push(prism(zPin, zTop, region([rect(0, 0, G.W, G.L)])));
+  // 3) Üst özellikler: L-duvar, kabartma, kılavuz pimleri
+  const t = G.t;
+  const Lwall = [pt(0, 0), pt(G.W, 0), pt(G.W, t), pt(t, t), pt(t, G.L), pt(0, G.L)];
+  const feats = [];
+  if (P.wallH > 0) feats.push({ paths: [Lwall], h: U(P.wallH) });
+  if (design.length && P.embossH > 0) feats.push({ paths: design, h: U(P.embossH) });
+  const others = feats.reduce((m, f) => Math.max(m, f.h), 0);
+  const pinH = U(P.guideH), r = P.guideD / 2;
+  let cham = U(Math.min(P.pinChamfer, r * 0.8));
+  let prismH = pinH;
+  if (cham > 0 && pinH - cham > others + U(0.05)) prismH = pinH - cham; else cham = 0;
+  const NPIN = 48;
+  const pinCircles = G.pins.map(p => circle(p.x, p.y, r, NPIN));
+  if (pinH > 0) feats.push({ paths: pinCircles, h: prismH });
+  const hs = [...new Set(feats.map(f => f.h))].sort((a, b) => a - b);
+  let prev = 0;
+  for (const h of hs) {
+    if (h <= prev) continue;
+    const paths = [];
+    for (const f of feats) if (f.h >= h) paths.push(...f.paths);
+    layers.push(prism(zTop + prev, zTop + h, region(paths)));
+    prev = h;
+  }
+  // 4) Pahlı (konik) pim uçları
+  if (cham > 0) {
+    const rTop = (r * S - cham) / S;
+    layers.push({
+      z0: zTop + prismH, z1: zTop + pinH,
+      bot: pinCircles,
+      top: G.pins.map(p => circle(p.x, p.y, rTop, NPIN))
+    });
+  }
+  const res = buildSolid(layers);
+  res.height = (zTop + Math.max(prev, pinH)) / S;
+  res.zTop = zTop / S;
+  return res;
+}
+
+function buildFemale(P, design, G) {
+  const T = U(P.plateT);
+  const lim = T - U(0.4);
+  const nd = Math.max(0, Math.min(U(P.nutDepth), lim));
+  const hd = Math.max(0, Math.min(U(P.guideH + P.holeExtra), lim));
+  const cd = Math.max(0, Math.min(U(P.cavityD), lim));
+  const outline = rect(G.fx0, G.fy0, G.fx1, G.fy1);
+  const hex = hexagon(G.cx, G.cy, P.nutAF);
+  const holes = G.pins.map(p => circle(p.x, p.y, G.holeD / 2, 48, true));
+  const cavity = design.length ? offsetPaths(design, U(P.paperOff)) : [];
+  const bps = new Set([0, T]);
+  if (nd > 0) bps.add(nd);
+  if (hd > 0) bps.add(T - hd);
+  if (cavity.length && cd > 0) bps.add(T - cd);
+  const zs = [...bps].sort((a, b) => a - b);
+  const layers = [];
+  for (let i = 0; i + 1 < zs.length; i++) {
+    const z0 = zs[i], z1 = zs[i + 1], mid = (z0 + z1) / 2;
+    const clips = [];
+    if (nd > 0 && mid < nd) clips.push(hex);
+    if (hd > 0 && mid > T - hd) clips.push(...holes);
+    if (cavity.length && cd > 0 && mid > T - cd) clips.push(...cavity);
+    layers.push(prism(z0, z1, clips.length ? difference([outline], clips) : region([outline])));
+  }
+  // Baskı yönü: oyuk yukarı bakar. Montajda X ekseni etrafında 180° çevrileceği
+  // için 2D yerleşim Y'de aynalanır → çevrildiğinde erkek desenle birebir örtüşür.
+  const res = buildSolid(layers, U(G.L));
+  Object.assign(res, { outline: [outline], hex: [hex], holes, cavity, nd: nd / S, hd: hd / S, cd: cd / S, height: P.plateT });
+  return res;
+}
+
+/* =====================================================================
+   4) ARAYÜZ PARAMETRELERİ
+   ===================================================================== */
+const SECTIONS = [
+  { title: '1 · Tasarım (SVG) Ayarları', svg: true, fields: [
+    { k: 'designW', l: 'Tasarım Genişliği', v: 25, min: 1, step: 0.5 },
+    { k: 'designX', l: 'Tasarım X Konumu', h: 'L-duvar iç yüzünden', v: 6, step: 0.5 },
+    { k: 'designY', l: 'Tasarım Y Konumu', h: 'L-duvar iç yüzünden', v: 6, step: 0.5 },
+    { k: 'mirror', l: 'Yatay Aynalama (Mirror)', v: false, type: 'bool' },
+  ]},
+  { title: '2 · El Tulumba Presi Bağlantıları', fields: [
+    { k: 'pressPinD', l: 'Alt Kalıp Pim Çapı', h: '12 mm yuva için 0.2 mm pay', v: 11.8, min: 2, step: 0.1 },
+    { k: 'pressPinL', l: 'Alt Kalıp Pim Uzunluğu', v: 12, min: 0.5, step: 0.5 },
+    { k: 'nutAF', l: 'M8 Somun Yuvası Anahtar Ağzı', h: 'altıgen, 0.2 mm paylı', v: 13.2, min: 2, step: 0.1 },
+    { k: 'nutDepth', l: 'M8 Somun Yuvası Derinliği', v: 6.5, min: 0, step: 0.1 },
+  ]},
+  { title: '3 · Kalıp Gövde & L-Stoper', fields: [
+    { k: 'baseW', l: 'Alt Kalıp Taban Genişliği (X)', v: 45, min: 10, step: 1 },
+    { k: 'baseL', l: 'Alt Kalıp Taban Uzunluğu (Y)', v: 45, min: 10, step: 1 },
+    { k: 'plateT', l: 'Taban Plaka Kalınlığı', v: 8, min: 1, step: 0.1 },
+    { k: 'wallH', l: 'L-Duvar Yüksekliği', h: 'sadece alt kalıpta', v: 1.8, min: 0, step: 0.1 },
+    { k: 'wallT', l: 'L-Duvar Kalınlığı', v: 2, min: 0.4, step: 0.1 },
+    { k: 'upperGap', l: 'Üst Kalıp Güvenlik Boşluğu', v: 1.2, min: 0, step: 0.1 },
+  ]},
+  { title: '4 · Hizalama Pimleri ve Delikleri', fields: [
+    { k: 'guideD', l: 'Kılavuz Pimi Çapı', v: 4, min: 0.5, step: 0.1 },
+    { k: 'guideH', l: 'Kılavuz Pimi Yüksekliği', v: 4.5, min: 0.2, step: 0.1 },
+    { k: 'pinTol', l: 'Pim-Delik Toleransı', h: 'delik Ø = pim Ø + tolerans', v: 0.3, min: 0, step: 0.05 },
+    { k: 'holeExtra', l: 'Delik Ek Derinliği', h: 'delik derinliği = pim yük. + bu', v: 1.5, min: 0, step: 0.1 },
+    { k: 'pinChamfer', l: 'Pim Ucu Pahı (45°)', v: 0.6, min: 0, step: 0.1 },
+  ]},
+  { title: '5 · Kabartma ve Kağıt Toleransları', fields: [
+    { k: 'embossH', l: 'Erkek Kabartma Yüksekliği', v: 0.9, min: 0.05, step: 0.05 },
+    { k: 'paperOff', l: 'Kağıt Payı / Dişi Oyuk Offset', h: 'Clipper ile dışa genişletme', v: 0.25, min: 0, step: 0.05 },
+    { k: 'cavityD', l: 'Dişi Oyuk Derinliği', v: 1.1, min: 0.05, step: 0.05 },
+  ]},
+];
+const P = {};
+const DEFAULTS = {};
+
+function buildPanel() {
+  const root = document.getElementById('sections');
+  for (const sec of SECTIONS) {
+    const d = document.createElement('details'); d.open = true;
+    d.innerHTML = `<summary>${sec.title}</summary><div class="body"></div>`;
+    const body = d.querySelector('.body');
+    if (sec.svg) {
+      body.insertAdjacentHTML('beforeend', `
+        <label class="file"><input type="file" id="svgFile" accept=".svg,image/svg+xml"></label>
+        <div class="btns"><button id="sampleBtn">Örnek logoyu yükle</button><button id="centerBtn">Tasarımı ortala</button></div>
+        <div class="filename" id="fileName"></div>`);
+    }
+    for (const f of sec.fields) {
+      P[f.k] = DEFAULTS[f.k] = f.v;
+      const row = document.createElement('div'); row.className = 'row';
+      const lab = `<label for="p_${f.k}">${f.l}${f.h ? `<small>${f.h}</small>` : ''}</label>`;
+      if (f.type === 'bool') {
+        row.innerHTML = `${lab}<input type="checkbox" id="p_${f.k}" ${f.v ? 'checked' : ''}><span class="unit"></span>`;
+        row.querySelector('input').addEventListener('change', e => { P[f.k] = e.target.checked; scheduleRebuild(); });
+      } else {
+        row.innerHTML = `${lab}<input type="number" id="p_${f.k}" value="${f.v}" step="${f.step}" ${f.min !== undefined ? `min="${f.min}"` : ''}><span class="unit">mm</span>`;
+        row.querySelector('input').addEventListener('input', e => {
+          let v = parseFloat(e.target.value);
+          if (!isFinite(v)) return;
+          if (f.min !== undefined && v < f.min) v = f.min;
+          P[f.k] = v; scheduleRebuild();
+        });
+      }
+      body.appendChild(row);
+    }
+    root.appendChild(d);
+  }
+}
+function setParam(k, v) { P[k] = v; const el = document.getElementById('p_' + k); if (el) el.value = +v.toFixed(2); }
+
+/* =====================================================================
+   5) ÖRNEK LOGO
+   ===================================================================== */
+function starPoints(cx, cy, ro, ri) {
+  const a = [];
+  for (let i = 0; i < 10; i++) {
+    const t = -Math.PI / 2 + i * Math.PI / 5, r = i % 2 ? ri : ro;
+    a.push((cx + r * Math.cos(t)).toFixed(2) + ',' + (cy + r * Math.sin(t)).toFixed(2));
+  }
+  return a.join(' ');
+}
+const SAMPLE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100">
+  <circle cx="50" cy="50" r="47" fill="#000"/>
+  <circle cx="50" cy="50" r="40" fill="#fff"/>
+  <polygon points="${starPoints(42, 56, 21, 8.5)}" fill="#000"/>
+  <circle cx="68" cy="34" r="10" fill="#000"/>
+  <circle cx="72" cy="30.5" r="8" fill="#fff"/>
+</svg>`;
+
+/* =====================================================================
+   6) 3D SAHNE
+   ===================================================================== */
+const view = document.getElementById('view');
+const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+renderer.localClippingEnabled = true;
+view.prepend(renderer.domElement);
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x14181e);
+THREE.Object3D.DEFAULT_UP.set(0, 0, 1);
+const camera = new THREE.PerspectiveCamera(40, 1, 0.5, 5000);
+camera.up.set(0, 0, 1);
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enableDamping = true;
+controls.dampingFactor = 0.12;
+
+scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x2a2622, 0.9));
+const sun = new THREE.DirectionalLight(0xffffff, 1.6); sun.position.set(-60, -90, 140); scene.add(sun);
+const fill = new THREE.DirectionalLight(0xffffff, 0.5); fill.position.set(120, 80, 60); scene.add(fill);
+
+const grid = new THREE.GridHelper(300, 30, 0x3a4250, 0x262c35);
+grid.rotation.x = Math.PI / 2; grid.position.z = -0.02; scene.add(grid);
+const fine = new THREE.GridHelper(300, 300, 0x1d2229, 0x1d2229);
+fine.rotation.x = Math.PI / 2; fine.position.z = -0.03; scene.add(fine);
+
+const section = new THREE.Plane(new THREE.Vector3(1, 0, 0), 0);
+function makePart(color) {
+  const group = new THREE.Group();
+  const mat = new THREE.MeshStandardMaterial({ color, roughness: 0.55, metalness: 0.05, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 });
+  const backMat = new THREE.MeshBasicMaterial({ color: 0xe0393f, side: THREE.BackSide });
+  const edgeMat = new THREE.LineBasicMaterial({ color: 0x07090c, transparent: true, opacity: 0.5 });
+  const wireMat = new THREE.MeshBasicMaterial({ color: 0xa8d4ff, wireframe: true, transparent: true, opacity: 0.09, depthWrite: false });
+  const mesh = new THREE.Mesh(new THREE.BufferGeometry(), mat);
+  const back = new THREE.Mesh(mesh.geometry, backMat);
+  const edges = new THREE.LineSegments(new THREE.BufferGeometry(), edgeMat);
+  const wire = new THREE.Mesh(new THREE.BufferGeometry(), wireMat);
+  group.add(mesh, back, edges, wire);
+  return { group, mat, backMat, edgeMat, wireMat, mesh, back, edges, wire, data: null };
+}
+const male = makePart(0x5b8def);
+const female = makePart(0xf0a43a);
+scene.add(male.group, female.group);
+
+function setPartGeometry(part, res) {
+  part.data = res;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(res.pos, 3));
+  g.setIndex(new THREE.BufferAttribute(res.idx, 1));
+  const disp = BufferGeometryUtils.toCreasedNormals(g, Math.PI / 7);
+  disp.computeBoundingBox();
+  for (const o of [part.mesh, part.edges, part.wire]) o.geometry.dispose();
+  part.mesh.geometry = disp;
+  part.back.geometry = disp;
+  part.edges.geometry = new THREE.EdgesGeometry(g, 25);
+  part.wire.geometry = g;
+}
+
+let mode = 0;
+let lastMode = -1;
+const openRange = document.getElementById('openRange');
+const cutRange = document.getElementById('cutRange');
+const wireChk = document.getElementById('wireChk');
+
+function applyMode(resetCam = false) {
+  if (!male.data || !female.data) return;
+  const G = layout(P);
+  const T = P.plateT;
+  const open = parseFloat(openRange.value);
+  const assembled = mode !== 0;
+  const zFace = male.data.zTop + P.paperOff + open; // dişi yüzeyin montajdaki Z'si
+
+  if (assembled) {
+    female.group.rotation.set(Math.PI, 0, 0);
+    female.group.position.set(0, G.L, zFace + T);
+  } else {
+    female.group.rotation.set(0, 0, 0);
+    female.group.position.set(G.W + 15, 0, 0);
+  }
+  female.group.updateMatrixWorld(true);
+
+  // Kesit düzlemi: iki kılavuz pimi + merkezden geçen dikey düzlem
+  const d = new THREE.Vector2(G.pins[1].x - G.pins[0].x, G.pins[1].y - G.pins[0].y).normalize();
+  const n = new THREE.Vector3(-d.y, d.x, 0);
+  if (n.x + n.y < 0) n.negate();
+  const off = parseFloat(cutRange.value);
+  section.normal.copy(n);
+  section.constant = -(n.x * G.cx + n.y * G.cy) - off;
+
+  const sect = mode === 2;
+  for (const part of [male, female]) {
+    const planes = sect ? [section] : [];
+    part.mat.clippingPlanes = planes; part.backMat.clippingPlanes = planes; part.edgeMat.clippingPlanes = planes;
+    part.back.visible = sect;
+    part.wire.visible = sect && wireChk.checked;
+    part.mat.transparent = false; part.mat.opacity = 1; part.mat.depthWrite = true;
+    part.edgeMat.opacity = 0.5;
+    part.mat.needsUpdate = part.backMat.needsUpdate = part.edgeMat.needsUpdate = true;
+  }
+  if (mode === 1) {
+    female.mat.transparent = true; female.mat.opacity = 0.38; female.mat.depthWrite = false;
+    female.edgeMat.opacity = 0.35;
+    female.mat.needsUpdate = true;
+  }
+
+  document.getElementById('viewopts').style.display = assembled ? 'flex' : 'none';
+  document.getElementById('optCut').style.display = sect ? 'flex' : 'none';
+  document.getElementById('optWire').style.display = sect ? 'flex' : 'none';
+  document.getElementById('optHint').textContent = sect
+    ? 'Kesit, iki kılavuz pimi ve merkezden geçer. Kırmızı = kesilen iç malzeme. Somun yuvası, pim delikleri ve oyuk tabanındaki et kalınlığını buradan kontrol edin.'
+    : 'Üst kalıp yarı saydam; pimlerin deliklere ve kabartmanın oyuğa oturduğunu kontrol edin. Açıklık ile kalıbı kaldırın.';
+  cutRange.min = -Math.round(Math.max(G.W, G.L) / 2); cutRange.max = -cutRange.min;
+  document.getElementById('openVal').textContent = open.toFixed(1) + ' mm';
+  document.getElementById('cutVal').textContent = off.toFixed(1) + ' mm';
+
+  if (resetCam || lastMode !== mode) fitCamera();
+  lastMode = mode;
+}
+
+function fitCamera() {
+  const box = new THREE.Box3();
+  male.group.updateMatrixWorld(true); female.group.updateMatrixWorld(true);
+  box.expandByObject(male.mesh); box.expandByObject(female.mesh);
+  const c = box.getCenter(new THREE.Vector3());
+  const size = box.getSize(new THREE.Vector3()).length();
+  const dir = mode === 0 ? new THREE.Vector3(-0.15, -1, 0.85)
+            : mode === 1 ? new THREE.Vector3(0.75, -1, 0.75)
+            : new THREE.Vector3(-1, -1, 0.55);
+  if (mode === 2) {
+    // kesit yüzüne bakan taraf
+    dir.set(-section.normal.x, -section.normal.y, 0).normalize().add(new THREE.Vector3(0.25 * section.normal.y, -0.25 * section.normal.x, 0.45));
+  }
+  dir.normalize();
+  const dist = size / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2)) * 0.95;
+  controls.target.copy(c);
+  camera.position.copy(c).addScaledVector(dir, dist);
+  camera.near = dist / 100; camera.far = dist * 20; camera.updateProjectionMatrix();
+  controls.update();
+}
+
+function resize() {
+  const w = view.clientWidth, h = view.clientHeight;
+  renderer.setSize(w, h, false);
+  camera.aspect = w / Math.max(h, 1); camera.updateProjectionMatrix();
+}
+new ResizeObserver(resize).observe(view);
+resize();
+renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+
+/* =====================================================================
+   7) YENİDEN OLUŞTURMA + KONTROLLER
+   ===================================================================== */
+let rawDesign = null;
+let timer = null;
+let firstBuild = true;
+const busy = document.getElementById('busy');
+function scheduleRebuild() {
+  clearTimeout(timer);
+  busy.style.display = 'block';
+  timer = setTimeout(rebuild, 120);
+}
+
+function rebuild() {
+  busy.style.display = 'none';
+  const warn = [];
+  try {
+    const G = layout(P);
+    if (G.fx1 - G.fx0 < 2 * G.m + 1 || G.fy1 - G.fy0 < 2 * G.m + 1) throw new Error('Taban ölçüleri, duvar+boşluk+pim deliklerine göre çok küçük.');
+    const placed = rawDesign ? placeDesign(rawDesign, P) : { paths: [], w: 0, h: 0 };
+    const design = placed.paths;
+    const m = buildMale(P, design, G);
+    const f = buildFemale(P, design, G);
+    setPartGeometry(male, m);
+    setPartGeometry(female, f);
+
+    // ---- Kontroller / uyarılar ----
+    const Lwall = [[pt(0, 0), pt(G.W, 0), pt(G.W, G.t), pt(G.t, G.t), pt(G.t, G.L), pt(0, G.L)]];
+    if (interArea(design, Lwall) > 0.001) warn.push(['err', 'Erkek desen L-dayama duvarıyla çakışıyor. Tasarım konumunu artırın.']);
+    else if (design.length) {
+      const db = bounds(design);
+      if (db.x0 < U(G.t + 0.3) || db.y0 < U(G.t + 0.3)) warn.push(['err', 'Erkek desen L-dayama duvarına değiyor (≥ 0.3 mm boşluk bırakın).']);
+    }
+    if (diffArea(f.cavity, f.outline) > 0.001) warn.push(['err', 'Dişi oyuk, üst kalıbın dış sınırından taşıyor. Tasarımı küçültün veya içeri alın.']);
+    if (interArea(f.cavity, f.holes) > 0.001) warn.push(['err', 'Dişi oyuk kılavuz pimi delikleriyle çakışıyor. Tasarımı pimlerden uzaklaştırın.']);
+    const clearPin = G.pins.map(p => circle(p.x, p.y, G.holeD / 2 + 0.8, 32));
+    if (interArea(design, clearPin) > 0.001 && !(interArea(f.cavity, f.holes) > 0.001)) warn.push(['warn', 'Desen kılavuz pimine 0.8 mm\'den yakın.']);
+    if (diffArea(f.hex, f.outline) > 0.001) warn.push(['err', 'Somun yuvası üst kalıp ayak izinden büyük.']);
+    const pressR = P.pressPinD / 2;
+    if (pressR > Math.min(G.W, G.L) / 2) warn.push(['err', 'Pres pimi çapı taban plakasından büyük.']);
+    const floor = P.plateT - f.nd - f.cd;
+    if (interArea(f.cavity, f.hex) > 0.001 && floor < 1.0) {
+      warn.push([floor < 0.6 ? 'warn' : 'warn', `Dişi oyuk somun yuvasının üzerine geliyor: arada yalnızca <b>${floor.toFixed(2)} mm</b> et kalıyor (öneri ≥ 1.0 mm). Plaka kalınlığını <b>${(f.nd + f.cd + 1.0).toFixed(1)} mm</b> yapın veya somun derinliğini azaltın.`]);
+    }
+    const holeFloor = P.plateT - f.hd;
+    if (interArea(f.holes, f.hex) > 0.001 && f.nd > holeFloor) warn.push(['err', 'Pim delikleri somun yuvasına kesişiyor.']);
+    if (P.guideH + P.holeExtra > P.plateT - 0.4) warn.push(['warn', `Pim deliği derinliği plaka kalınlığı nedeniyle ${f.hd.toFixed(2)} mm ile sınırlandı.`]);
+    if (P.nutDepth > P.plateT - 0.4) warn.push(['warn', `Somun yuvası derinliği ${f.nd.toFixed(2)} mm ile sınırlandı.`]);
+    if (P.cavityD < P.embossH) warn.push(['warn', 'Dişi oyuk derinliği erkek kabartma yüksekliğinden küçük; kağıt ezilebilir.']);
+    if (P.guideH <= P.wallH) warn.push(['warn', 'Kılavuz pimi L-duvardan kısa; hizalama zayıf olur.']);
+    if (!rawDesign) warn.push(['warn', 'Tasarım yüklenmedi.']);
+    if (m.badEdges || f.badEdges) warn.push(['err', `Ağ kontrolü: açık/çakışan kenar bulundu (alt ${m.badEdges}, üst ${f.badEdges}). Parametreleri biraz değiştirip tekrar deneyin.`]);
+    if (!warn.length) warn.push(['ok', 'Tüm kontroller başarılı. Kalıplar baskıya hazır.']);
+
+    document.getElementById('info').innerHTML = `
+      Tasarım: <b>${placed.w.toFixed(2)} × ${placed.h.toFixed(2)} mm</b><br>
+      Alt kalıp: <b>${G.W} × ${G.L} mm</b>, toplam yükseklik <b>${m.height.toFixed(2)} mm</b><br>
+      Üst kalıp: <b>${(G.fx1 - G.fx0).toFixed(1)} × ${(G.fy1 - G.fy0).toFixed(1)} × ${P.plateT} mm</b><br>
+      Pim deliği: Ø<b>${G.holeD.toFixed(2)}</b>, derinlik <b>${f.hd.toFixed(2)} mm</b> · Somun yuvası: <b>${P.nutAF} mm</b> × <b>${f.nd.toFixed(2)} mm</b>`;
+
+    const st = (r, name, col) => `<div class="part"><span class="dot" style="background:${col}"></span>${name}:
+      <span class="${r.badEdges ? 'bad' : 'good'}">${r.badEdges ? '⚠ ' + r.badEdges + ' hatalı kenar' : '✓ su geçirmez (manifold)'}</span>
+      · ${r.triCount.toLocaleString('tr-TR')} üçgen</div>`;
+    document.getElementById('status').innerHTML = st(m, 'Alt Kalıp (Erkek)', '#5b8def') + st(f, 'Üst Kalıp (Dişi)', '#f0a43a');
+    applyMode(firstBuild);
+    firstBuild = false;
+  } catch (e) {
+    console.error(e);
+    warn.push(['err', 'Hata: ' + (e && e.message ? e.message : e)]);
+  }
+  document.getElementById('warnings').innerHTML = warn.map(([k, t]) => `<div class="msg ${k}">${t}</div>`).join('');
+}
+
+/* =====================================================================
+   8) OLAYLAR
+   ===================================================================== */
+buildPanel();
+
+function loadSVGText(text, name) {
+  try {
+    rawDesign = parseSVG(text);
+    document.getElementById('fileName').textContent = 'Yüklü: ' + name;
+  } catch (e) {
+    document.getElementById('fileName').textContent = 'SVG okunamadı: ' + e.message;
+  }
+  scheduleRebuild();
+}
+document.getElementById('svgFile').addEventListener('change', e => {
+  const file = e.target.files && e.target.files[0];
+  if (!file) return;
+  const r = new FileReader();
+  r.onload = () => loadSVGText(String(r.result), file.name);
+  r.readAsText(file);
+});
+document.getElementById('sampleBtn').addEventListener('click', () => {
+  document.getElementById('svgFile').value = '';
+  loadSVGText(SAMPLE_SVG, 'örnek logo');
+});
+document.getElementById('centerBtn').addEventListener('click', () => {
+  if (!rawDesign) return;
+  const h = P.designW * rawDesign.aspect;
+  setParam('designX', P.baseW / 2 - P.wallT - P.designW / 2);
+  setParam('designY', P.baseL / 2 - P.wallT - h / 2);
+  scheduleRebuild();
+});
+document.querySelectorAll('#modes button').forEach(b => b.addEventListener('click', () => {
+  document.querySelectorAll('#modes button').forEach(x => x.classList.toggle('active', x === b));
+  mode = +b.dataset.mode;
+  applyMode();
+}));
+openRange.addEventListener('input', () => applyMode());
+cutRange.addEventListener('input', () => applyMode());
+wireChk.addEventListener('change', () => applyMode());
+document.getElementById('resetView').addEventListener('click', () => fitCamera());
+
+const exporter = new STLExporter();
+function downloadPart(which) {
+  const part = which === 'male' ? male : female;
+  if (!part.data) return;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(part.data.pos, 3));
+  g.setIndex(new THREE.BufferAttribute(part.data.idx, 1));
+  const mesh = new THREE.Mesh(g);   // baskı yönünde, Z=0 tabanlı, mm
+  mesh.updateMatrixWorld(true);
+  const data = exporter.parse(mesh, { binary: true });
+  const blob = new Blob([data], { type: 'model/stl' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = which === 'male' ? 'alt_kalip_erkek.stl' : 'ust_kalip_disi.stl';
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 2000);
+}
+document.querySelectorAll('[data-dl]').forEach(b => b.addEventListener('click', () => downloadPart(b.dataset.dl)));
+
+// Test/hata ayıklama erişimi
+window.stampApp = { P, male, female, rebuild, setMode: m => document.querySelector(`#modes button[data-mode="${m}"]`).click(), downloadPart };
+
+loadSVGText(SAMPLE_SVG, 'örnek logo');
+</script>
+</body>
+</html>
