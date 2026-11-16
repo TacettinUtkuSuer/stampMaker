@@ -113,8 +113,8 @@
 
   <details open id="dlSection"><summary>⬇ İndirmeler</summary><div class="body">
     <div class="btns">
-      <button class="primary dl-male" data-dl="male">Alt Kalıp (Erkek) .STL</button>
-      <button class="primary dl-female" data-dl="female">Üst Kalıp (Dişi) .STL</button>
+      <button class="primary dl-male" data-dl="male">Alt Kalıp .STL</button>
+      <button class="primary dl-female" data-dl="female">Üst Kalıp .STL</button>
     </div>
     <div class="btns" id="insertBtns"></div>
     <div class="btns">
@@ -149,6 +149,7 @@
     <div class="row" id="optWire"><label>Tel kafes katmanı</label><input type="checkbox" id="wireChk" checked></div>
     <div class="row"><label>İnce bölgeleri göster</label><input type="checkbox" id="thinChk" checked></div>
     <div class="row"><label>Bileti göster</label><input type="checkbox" id="ticketChk" checked></div>
+    <div class="row"><label><span style="color:#22d3ee">●</span> Pres ekseni / <span style="color:#ff3fd2">●</span> yük merkezi</label><input type="checkbox" id="axisChk" checked></div>
     <div class="row" id="optHint" style="color:var(--muted);font-size:11px"></div>
   </div>
   <div id="status" class="overlay card"></div>
@@ -197,10 +198,10 @@ function hexagon(cx, cy, af) {
 }
 
 /* ---------- Clipper sarmalayıcıları ---------- */
-function clipOp(type, subj, clp, fill = NZ, asTree = false) {
+function clipOp(type, subj, clp, fill = NZ, asTree = false, strict = true) {
   const c = new CL.Clipper();
   c.PreserveCollinear = true;
-  c.StrictlySimple = true;
+  c.StrictlySimple = strict;
   const ok = p => p && p.length >= 3;
   c.AddPaths(subj.filter(ok), CL.PolyType.ptSubject, true);
   if (clp && clp.length) c.AddPaths(clp.filter(ok), CL.PolyType.ptClip, true);
@@ -270,16 +271,17 @@ function samePaths(A, B) {
   return true;
 }
 // "Açma" ile ince bölgeler: d genişliğinden ince çizgiler
-function thinParts(paths, width) {
+function thinParts(paths, width, minPiece = 0.08) {
   if (!paths.length || width <= 0) return [];
   const r = U(width / 2);
   const opened = offsetPaths(offsetPaths(paths, -r), Math.round(r * 1.8));
-  return difference(paths, opened, 0.08 * S * S);   // küçük parçalar = keskin uç, yok say
+  return difference(paths, opened, minPiece * S * S);   // küçük parçalar = keskin uç, yok say
 }
 
 /* =====================================================================
    1) KATMANLI KATI GÖVDE → tek manifold ağ
    ===================================================================== */
+let STRICT_CAPS = false;
 function buildSolid(layers) {
   layers = layers.filter(l => l.z1 > l.z0 && l.bot.length);
   const pos = [], vmap = new Map();
@@ -302,7 +304,9 @@ function buildSolid(layers) {
       }
     }
   }
-  const addCap = (shapes, z, up) => {
+  // Yüzey üçgenleme; alan tutmazsa (kısıtsız Clipper çıktısı) false döner
+  const addCap = (shapes, z, up, check = false) => {
+    const pending = [];
     for (const sh of shapes) {
       if (sh.outer.length < 3) continue;
       const contour = sh.outer.map(p => new THREE.Vector2(p.X, p.Y));
@@ -312,9 +316,16 @@ function buildSolid(layers) {
       const ids = all.map(p => V(p.x, p.y, z));
       let sum = 0;
       for (const f of faces) { const A = all[f[0]], B = all[f[1]], C = all[f[2]]; sum += (B.x - A.x) * (C.y - A.y) - (B.y - A.y) * (C.x - A.x); }
+      if (check) {
+        const exp = Math.abs(signedArea(sh.outer)) - sh.holes.reduce((a, h) => a + Math.abs(signedArea(h)), 0);
+        if (Math.abs(Math.abs(sum) / 2 - exp) > Math.max(50, exp * 1e-4)) return false;
+      }
       const flip = up ? sum < 0 : sum > 0;
-      for (const f of faces) flip ? T(ids[f[0]], ids[f[2]], ids[f[1]]) : T(ids[f[0]], ids[f[1]], ids[f[2]]);
+      pending.push([faces, ids, flip]);
     }
+    for (const [faces, ids, flip] of pending)
+      for (const f of faces) flip ? T(ids[f[0]], ids[f[2]], ids[f[1]]) : T(ids[f[0]], ids[f[1]], ids[f[2]]);
+    return true;
   };
   const capOf = paths => treeShapes(clipOp(CL.ClipType.ctUnion, paths, null, NZ, true));
   if (layers.length) {
@@ -328,8 +339,10 @@ function buildSolid(layers) {
       }
       if (samePaths(A, B)) continue;
       const z = layers[i].z1;
-      addCap(treeShapes(clipOp(CL.ClipType.ctDifference, A, B, NZ, true)), z, true);
-      addCap(treeShapes(clipOp(CL.ClipType.ctDifference, B, A, NZ, true)), z, false);
+      for (const [X, Y, up] of [[A, B, true], [B, A, false]]) {
+        if (!addCap(treeShapes(clipOp(CL.ClipType.ctDifference, X, Y, NZ, true, STRICT_CAPS)), z, up, !STRICT_CAPS))
+          addCap(treeShapes(clipOp(CL.ClipType.ctDifference, X, Y, NZ, true, true)), z, up);
+      }
     }
     const last = layers[layers.length - 1];
     addCap(capOf(last.top), last.z1, true);
@@ -339,15 +352,17 @@ function buildSolid(layers) {
   const bad = countBadEdges(tris);
   if (window.__dbg && bad) (window.__bads = window.__bads || []).push(window.__badList.map(([a, b, c, r]) => [pos.slice(a * 3, a * 3 + 3).join(','), pos.slice(b * 3, b * 3 + 3).join(','), c, r]));
   const P = new Float32Array(pos.length);
+  let zMin = Infinity, zMax = -Infinity;
   for (let i = 0; i < pos.length; i++) P[i] = pos[i] / S;
+  for (let i = 2; i < P.length; i += 3) { if (P[i] < zMin) zMin = P[i]; if (P[i] > zMax) zMax = P[i]; }
   const I = new Uint32Array(tris.length * 3);
   for (let i = 0; i < tris.length; i++) { I[i * 3] = tris[i][0]; I[i * 3 + 1] = tris[i][1]; I[i * 3 + 2] = tris[i][2]; }
-  return { pos: P, idx: I, triCount: tris.length, badEdges: bad };
+  return { pos: P, idx: I, triCount: tris.length, badEdges: bad, zMin, zMax };
 }
 
 const EK = 4194304;
 function repairTJunctions(pos, tris) {
-  const EPS = 2, CELL = 1000;
+  const EPS = 6, CELL = 1000;
   for (let iter = 0; iter < 16; iter++) {
     const cnt = new Map();
     const key = (a, b) => a < b ? a * EK + b : b * EK + a;
@@ -440,25 +455,53 @@ function stack({ solids = [], cuts = [], profiles = [] }) {
 // Aynı noktada değen konturlar (teğet şekiller) manifold olmayan kenar üretir:
 // paylaşılan köşeyi her konturda 2 µm malzemenin içine kaydır.
 function separateTouching(paths) {
-  if (paths.length < 2) return paths;
-  const seen = new Map();
-  paths.forEach((p, ci) => p.forEach(v => { const k = v.X + ',' + v.Y; const s = seen.get(k); if (s === undefined) seen.set(k, ci); else if (s !== ci) seen.set(k, -1); }));
+  if (!paths.length) return paths;
+  // 1) farklı konturlarda aynı köşe  2) bir köşenin başka bir kenara (≤2 µm) değmesi
+  const CELL = 300, grid = new Map(), key = (x, y) => x * 1000003 + y;
+  paths.forEach((p, ci) => p.forEach((a, i) => {
+    const b = p[(i + 1) % p.length];
+    const x0 = Math.floor((Math.min(a.X, b.X) - 3) / CELL), x1 = Math.floor((Math.max(a.X, b.X) + 3) / CELL);
+    const y0 = Math.floor((Math.min(a.Y, b.Y) - 3) / CELL), y1 = Math.floor((Math.max(a.Y, b.Y) + 3) / CELL);
+    if ((x1 - x0 + 1) * (y1 - y0 + 1) > 400) return;
+    for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) { const k = key(x, y); let arr = grid.get(k); if (!arr) grid.set(k, arr = []); arr.push(ci, i); }
+  }));
+  const touch = paths.map(() => null);
   let any = false;
-  for (const v of seen.values()) if (v === -1) { any = true; break; }
+  paths.forEach((p, ci) => p.forEach((v, vi) => {
+    const arr = grid.get(key(Math.floor(v.X / CELL), Math.floor(v.Y / CELL)));
+    if (!arr) return;
+    for (let k = 0; k < arr.length; k += 2) {
+      const cj = arr[k], ej = arr[k + 1], q = paths[cj];
+      if (cj === ci && (ej === vi || (ej + 1) % q.length === vi || ej === (vi + 1) % p.length || (ej + 1) % q.length === (vi + p.length - 1) % p.length)) continue;
+      const a = q[ej], b = q[(ej + 1) % q.length];
+      const dx = b.X - a.X, dy = b.Y - a.Y, l2 = dx * dx + dy * dy;
+      let t = l2 ? ((v.X - a.X) * dx + (v.Y - a.Y) * dy) / l2 : 0; t = Math.max(0, Math.min(1, t));
+      const ex = a.X + dx * t - v.X, ey = a.Y + dy * t - v.Y;
+      if (ex * ex + ey * ey <= 4) { (touch[ci] = touch[ci] || new Set()).add(vi); any = true; break; }
+    }
+  }));
   if (!any) return paths;
-  return paths.map(p => p.map((v, i) => {
-    if (seen.get(v.X + ',' + v.Y) !== -1) return v;
+  return paths.map((p, ci) => !touch[ci] ? p : p.map((v, i) => {
+    if (!touch[ci].has(i)) return v;
     const a = p[(i - 1 + p.length) % p.length], b = p[(i + 1) % p.length];
-    let e1x = v.X - a.X, e1y = v.Y - a.Y, e2x = b.X - v.X, e2y = b.Y - v.Y;
+    const e1x = v.X - a.X, e1y = v.Y - a.Y, e2x = b.X - v.X, e2y = b.Y - v.Y;
     const l1 = Math.hypot(e1x, e1y) || 1, l2 = Math.hypot(e2x, e2y) || 1;
     let nx = -e1y / l1 - e2y / l2, ny = e1x / l1 + e2x / l2;
     const ln = Math.hypot(nx, ny);
     if (ln < 1e-9) { nx = -e1y / l1; ny = e1x / l1; } else { nx /= ln; ny /= ln; }
-    return { X: v.X + Math.round(nx * 3), Y: v.Y + Math.round(ny * 3) };
+    return { X: v.X + Math.round(nx * 4), Y: v.Y + Math.round(ny * 4) };
   }));
 }
 function frustum(cx, cy, r0, r1, zb, zt, n = 48) {
   return { z0: U(zb), z1: U(zt), at: zU => { const t = (zU / S - zb) / (zt - zb); return circle(cx, cy, r0 + (r1 - r0) * t, n); } };
+}
+// Delik ağzı pahı: zFace'te en geniş, dir yönünde c boyunca daralır (delik → CW kontur)
+function holeCham(cx, cy, r, c, zFace, dir = 1, n = 48) {
+  const za = U(zFace), zb = U(zFace + dir * c);
+  return { z0: Math.min(za, zb), z1: Math.max(za, zb), at: zU => {
+    const d = Math.abs(zU / S - zFace);
+    return circle(cx, cy, r + Math.max(0, c - d), n, true).reverse();
+  } };
 }
 // Metrik diş (ISO profil yaklaşımı, sağ el). kind: 'ext' (cıvata) | 'int' (delik)
 const THREADS = { M5: { d: 5, p: 0.8, af: 8 }, M6: { d: 6, p: 1.0, af: 10 }, M8: { d: 8, p: 1.25, af: 13 }, M10: { d: 10, p: 1.5, af: 16 } };
@@ -504,14 +547,16 @@ function pinPart(r, len, chamTop, chamBot, n = 64) {
 /* =====================================================================
    2) SVG → 2D BÖLGE (koyu = ekle, açık/beyaz = çıkar)
    ===================================================================== */
-function isDarkColor(str, fallback) {
+function lumOf(str, fallback) {
   try {
     const c = new THREE.Color();
     if (fallback && fallback.isColor) c.copy(fallback); else c.setStyle(str);
     const s = c.clone().convertLinearToSRGB();
-    return (0.2126 * s.r + 0.7152 * s.g + 0.0722 * s.b) < 0.5;
-  } catch (e) { return true; }
+    return 0.2126 * s.r + 0.7152 * s.g + 0.0722 * s.b;
+  } catch (e) { return 0; }
 }
+// Gri ton → kabartma seviyesi (siyah = %100). 4 kademe: 25/50/75/100. Açık tonlar (<%20) = boşluk.
+function levelOf(lum) { const q = Math.round((1 - lum) * 4) / 4; return q < 0.2 ? 0 : q; }
 function parseSVG(text) {
   const data = new SVGLoader().parse(text);
   const items = [];
@@ -528,15 +573,15 @@ function parseSVG(text) {
     for (const s of subs) for (const p of s.pts) { x0 = Math.min(x0, p.x); x1 = Math.max(x1, p.x); y0 = Math.min(y0, p.y); y1 = Math.max(y1, p.y); }
     const op = (st.opacity ?? 1);
     if (st.fill && st.fill !== 'none' && st.fill !== 'transparent' && (st.fillOpacity ?? 1) > 0 && op > 0)
-      items.push({ type: 'fill', subs, evenodd: st.fillRule === 'evenodd', dark: isDarkColor(st.fill, path.color) });
+      items.push({ type: 'fill', subs, evenodd: st.fillRule === 'evenodd', level: levelOf(lumOf(st.fill, path.color)) });
     const sw = parseFloat(st.strokeWidth);
     if (st.stroke && st.stroke !== 'none' && st.stroke !== 'transparent' && sw > 0 && (st.strokeOpacity ?? 1) > 0 && op > 0)
-      items.push({ type: 'stroke', subs, width: sw, dark: isDarkColor(st.stroke), join: st.strokeLineJoin, cap: st.strokeLineCap });
+      items.push({ type: 'stroke', subs, width: sw, level: levelOf(lumOf(st.stroke)), join: st.strokeLineJoin, cap: st.strokeLineCap });
   }
   if (!items.length || !isFinite(x0)) throw new Error('SVG içinde dolgulu/çizgili bir yol bulunamadı.');
   const R = 100000 / (Math.max(x1 - x0, y1 - y0) || 1);
   const toInt = p => ({ X: Math.round((p.x - x0) * R), Y: Math.round(-(p.y - y0) * R) });
-  let acc = [];
+  const acc = new Map();   // seviye → bölge (üstte boyanan alttakini örter)
   for (const it of items) {
     let reg;
     if (it.type === 'fill') {
@@ -553,11 +598,17 @@ function parseSVG(text) {
       reg = new CL.Paths();
       co.Execute(reg, it.width / 2 * R);
     }
-    acc = it.dark ? clipOp(CL.ClipType.ctUnion, acc.concat(reg), null, NZ) : clipOp(CL.ClipType.ctDifference, acc, reg, NZ);
+    for (const [k, v] of acc) acc.set(k, clipOp(CL.ClipType.ctDifference, v, reg, NZ));
+    if (it.level > 0) acc.set(it.level, clipOp(CL.ClipType.ctUnion, (acc.get(it.level) || []).concat(reg), null, NZ));
   }
-  acc = region(CL.Clipper.CleanPolygons(acc, 1.5), 1e4);
-  if (!acc.length) throw new Error('SVG koyu (siyah) bir alan içermiyor.');
-  return { paths: acc, b: bounds(acc) };
+  const levels = [];
+  for (const [frac, v] of acc) {
+    const paths = region(CL.Clipper.CleanPolygons(v, 1.5), 1e4);
+    if (paths.length) levels.push({ frac, paths });
+  }
+  if (!levels.length) throw new Error('SVG koyu (siyah/gri) bir alan içermiyor.');
+  levels.sort((a, b) => a.frac - b.frac);
+  return { levels, b: bounds(levels.flatMap(l => l.paths)) };
 }
 
 /* =====================================================================
@@ -685,18 +736,32 @@ const show = {
   flat: () => P.textMode === 'flat',
   frame: () => P.frameOn,
   inner: () => P.innerOn,
-  stud: () => P.upperType !== 'thread' || true,
+  ring: () => P.frameOn || P.innerOn,
   nut: () => P.upperType === 'nut',
   thr: () => P.upperType === 'thread',
-  lpin: () => true,
   lhole: () => P.lowerType === 'hole',
   steel: () => P.guideType === 'steel',
+  steelBlind: () => P.guideType === 'steel' && P.lowerHoleMode === 'blind',
+  upBlind: () => P.upperHoleMode === 'blind',
   back: () => P.backOn,
+  manual: () => P.axisMode === 'manual',
+  fill: () => P.fillMode !== 'solid',
+  hatch: () => P.fillMode === 'hatch',
+};
+// Kağıt hazır ayarları: kalınlık, kabartma yüksekliği, oyuk derinliği (0.08 mm katman katları)
+const PAPERS = {
+  p80:  { name: '80 g/m² fotokopi (0.10 mm)', paperOff: 0.10, embossH: 0.48, cavityD: 0.64 },
+  p120: { name: '120 g/m² kalın kağıt (0.15 mm)', paperOff: 0.15, embossH: 0.56, cavityD: 0.72 },
+  p170: { name: '160–170 g/m² (0.20 mm)', paperOff: 0.20, embossH: 0.64, cavityD: 0.88 },
+  p250: { name: '250 g/m² karton (0.27 mm)', paperOff: 0.27, embossH: 0.72, cavityD: 1.04 },
+  p300: { name: '300 g/m² bilet kartonu (0.30 mm)', paperOff: 0.30, embossH: 0.72, cavityD: 1.04 },
+  p350: { name: '350 g/m² kalın karton (0.38 mm)', paperOff: 0.38, embossH: 0.80, cavityD: 1.20 },
 };
 const SECTIONS = [
   { title: '1 · Tasarım Yerleşimi', id: 'place', fields: [
-    { k: 'designX', l: 'Tasarım X Konumu', h: 'L-duvar iç yüzünden', v: 3.2, step: 0.5 },
-    { k: 'designY', l: 'Tasarım Y Konumu', h: 'L-duvar iç yüzünden', v: 3.2, step: 0.5 },
+    { k: 'relief', l: 'Kabartma yönü', v: 'emboss', type: 'select', opts: [['emboss', 'Kabartma (desen yükselir)'], ['deboss', 'Ters kabartma (desen gömülür)']] },
+    { k: 'designX', l: 'Tasarım Merkezi X', h: 'L-duvar iç yüzünden', v: 19.5, step: 0.5 },
+    { k: 'designY', l: 'Tasarım Merkezi Y', h: 'L-duvar iç yüzünden', v: 19.5, step: 0.5 },
     { k: 'mirror', l: 'Yatay Aynalama (Mirror)', v: false, type: 'bool' },
     { k: 'minLine', l: 'Min. çizgi kalınlığı', h: 'daha incesi kırmızı gösterilir', v: 0.5, min: 0, step: 0.05 },
     { k: 'minRib', l: 'Min. dişi duvar / boşluk', h: 'daha dar boşluk turuncu gösterilir', v: 0.35, min: 0, step: 0.05 },
@@ -710,8 +775,9 @@ const SECTIONS = [
     { k: 'logoW', l: 'Logo Genişliği', v: 10.5, min: 0.5, step: 0.5, show: show.logo },
     { k: 'logoDX', l: 'Logo X Kaydırma', h: 'tasarım merkezine göre', v: 0, step: 0.25, show: show.logo },
     { k: 'logoDY', l: 'Logo Y Kaydırma', v: 0, step: 0.25, show: show.logo },
+    { k: 'multiLevel', l: 'Gri tonlar = kabartma seviyesi', h: 'siyah %100, koyu gri %75, gri %50, açık gri %25', v: true, type: 'bool', show: show.logo },
   ]},
-  { title: '3 · Yazı', id: 'text', fields: [
+  { title: '3 · Yazı & Halkalar', id: 'text', fields: [
     { k: 'textMode', l: 'Yazı düzeni', v: 'circle', type: 'select', opts: [['none', 'Kapalı'], ['circle', 'Dairesel (mühür)'], ['flat', 'Düz yazı']] },
     { k: 'font', l: 'Font', v: 'montserrat', type: 'select', opts: Object.entries(FONTS).map(([k, f]) => [k, f.name]), show: show.text },
     { k: 'text', l: 'Metin', v: 'KAYITLI\n• ORİJİNAL •', type: 'textarea', show: show.text,
@@ -721,16 +787,37 @@ const SECTIONS = [
     { k: 'textR', l: 'Yazı Yarıçapı', h: 'harflerin iç kenarı', v: 10.6, min: 1, step: 0.1, show: show.circ },
     { k: 'lineSp', l: 'Satır Aralığı', h: 'harf yüksekliğinin katı', v: 1.4, min: 1, step: 0.05, show: show.flat, unit: '×' },
     { k: 'align', l: 'Hizalama', v: 'center', type: 'select', opts: [['left', 'Sola'], ['center', 'Ortaya'], ['right', 'Sağa']], show: show.flat },
-    { k: 'textDX', l: 'Yazı X Kaydırma', v: 0, step: 0.25, show: show.flat },
-    { k: 'textDY', l: 'Yazı Y Kaydırma', v: -8, step: 0.25, show: show.flat },
+    { k: 'textDX', l: 'Yazı X Kaydırma', h: 'dairesel modda halkalar da kayar', v: 0, step: 0.25, show: show.text },
+    { k: 'textDY', l: 'Yazı Y Kaydırma', v: 0, step: 0.25, show: show.text },
+    { k: 'textLevel', l: 'Yazı Kabartma Seviyesi', v: 100, min: 10, step: 5, unit: '%', show: show.text },
     { k: 'frameOn', l: 'Dış çerçeve halkası', v: true, type: 'bool' },
     { k: 'frameR', l: 'Çerçeve Dış Yarıçapı', v: 16.3, min: 1, step: 0.1, show: show.frame },
     { k: 'frameT', l: 'Çerçeve Kalınlığı', v: 0.8, min: 0.1, step: 0.05, show: show.frame },
     { k: 'innerOn', l: 'İç halka', v: true, type: 'bool' },
     { k: 'innerR', l: 'İç Halka Dış Yarıçapı', v: 8.8, min: 1, step: 0.1, show: show.inner },
     { k: 'innerT', l: 'İç Halka Kalınlığı', v: 0.6, min: 0.1, step: 0.05, show: show.inner },
+    { k: 'ringLevel', l: 'Halka Kabartma Seviyesi', v: 70, min: 10, step: 5, unit: '%', show: show.ring },
   ]},
-  { title: '4 · Pres Bağlantıları', id: 'press', fields: [
+  { title: '4 · Büyük Dolu Alanlar', id: 'fill', fields: [
+    { k: 'fillMode', l: 'Büyük alanlar', h: 'geniş dolu kabartma kartonu gerer/buruşturur', v: 'hatch', type: 'select', opts: [['solid', 'Dolu bırak'], ['outline', 'Sadece kontur'], ['hatch', 'Kontur + tarama']] },
+    { k: 'bigD', l: 'Büyük alan eşiği', h: 'bu çapta daire sığan alanlar', v: 4, min: 1, step: 0.5 },
+    { k: 'outlineW', l: 'Kontur Kalınlığı', v: 0.9, min: 0.3, step: 0.05, show: show.fill },
+    { k: 'hatchW', l: 'Tarama Çizgi Kalınlığı', v: 0.7, min: 0.3, step: 0.05, show: show.hatch },
+    { k: 'hatchS', l: 'Tarama Aralığı', h: 'çizgi merkezleri arası', v: 2.0, min: 0.6, step: 0.1, show: show.hatch },
+    { k: 'hatchA', l: 'Tarama Açısı', v: 45, step: 15, unit: '°', show: show.hatch },
+  ]},
+  { title: '5 · Kağıt & Kabartma', id: 'emboss', fields: [
+    { k: 'paper', l: 'Kağıt türü', v: 'p300', type: 'select', opts: [...Object.entries(PAPERS).map(([k, p]) => [k, p.name]), ['custom', 'Özel (elle)']] },
+    { k: 'paperOff', l: 'Kağıt Kalınlığı / Dişi Offset', v: 0.30, min: 0, step: 0.01 },
+    { k: 'embossH', l: 'Kabartma Yüksekliği', h: '%100 seviye', v: 0.72, min: 0.08, step: 0.04 },
+    { k: 'cavityD', l: 'Dişi Oyuk Derinliği', v: 1.04, min: 0.08, step: 0.04 },
+    { k: 'draft', l: 'Kabartma Kenar Eğimi', h: 'dikeyden açı; kağıt yırtılmaz', v: 20, min: 0, step: 1, unit: '°' },
+    { k: 'layerH', l: 'Yazıcı İnce Katman Yüksekliği', h: 'yükseklikler bunun katına yuvarlanır', v: 0.08, min: 0.04, step: 0.02 },
+  ]},
+  { title: '6 · Pres Bağlantıları', id: 'press', fields: [
+    { k: 'axisMode', l: 'Pres ekseni (M8 + Ø12)', v: 'auto', type: 'select', opts: [['auto', 'Otomatik: yük merkezine hizala'], ['center', 'Plaka merkezi'], ['manual', 'Elle (X/Y)']] },
+    { k: 'axisX', l: 'Eksen X', h: 'plaka sol kenarından', v: 25, step: 0.5, show: show.manual },
+    { k: 'axisY', l: 'Eksen Y', h: 'plaka alt kenarından', v: 25, step: 0.5, show: show.manual },
     { k: 'upperType', l: 'Üst kalıp bağlantısı', v: 'stud', type: 'select', opts: [['stud', 'Erkek cıvata (entegre)'], ['nut', 'Somun yuvası (dişi)'], ['thread', 'Dişli delik (dişi)']] },
     { k: 'threadSize', l: 'Diş ölçüsü', v: 'M8', type: 'select', opts: Object.keys(THREADS).map(k => [k, k + ' × ' + THREADS[k].p]) },
     { k: 'studLen', l: 'Cıvata Boyu (dışarıda)', v: 10, min: 2, step: 0.5 },
@@ -744,7 +831,7 @@ const SECTIONS = [
     { k: 'lowerHoleD', l: 'Alt Delik Çapı', h: 'ayrı pim sıkı oturur', v: 12.0, min: 2, step: 0.05, show: show.lhole },
     { k: 'lowerHoleDepth', l: 'Alt Delik Derinliği', v: 6, min: 1, step: 0.5, show: show.lhole },
   ]},
-  { title: '5 · Kalıp Gövde & L-Dayama', id: 'body', fields: [
+  { title: '7 · Kalıp Gövde & L-Dayama', id: 'body', fields: [
     { k: 'baseW', l: 'Taban Genişliği (X)', v: 50, min: 20, step: 1 },
     { k: 'baseL', l: 'Taban Uzunluğu (Y)', v: 50, min: 20, step: 1 },
     { k: 'lowerT', l: 'Alt Plaka Kalınlığı', v: 9, min: 2, step: 0.5 },
@@ -755,29 +842,26 @@ const SECTIONS = [
     { k: 'wallGap', l: 'Duvar Kanalı Yan Boşluğu', h: 'üst kalıpta', v: 0.5, min: 0.1, step: 0.05 },
     { k: 'grooveClear', l: 'Duvar Kanalı Üst Boşluğu', v: 0.6, min: 0.1, step: 0.1 },
   ]},
-  { title: '6 · Kılavuz Pimleri', id: 'guide', fields: [
+  { title: '8 · Kılavuz Pimleri ve Delikleri', id: 'guide', fields: [
     { k: 'guideType', l: 'Pim tipi', v: 'printed', type: 'select', opts: [['printed', 'Entegre (alt kalıpla tek parça)'], ['steel', 'Ayrı pim (çelik / basılı ek)']] },
     { k: 'guideD', l: 'Kılavuz Pimi Çapı', v: 4, min: 1, step: 0.1 },
     { k: 'guideH', l: 'Kılavuz Pimi Boyu', h: 'plakadan yükseklik', v: 5, min: 1, step: 0.5 },
-    { k: 'pinTol', l: 'Pim-Delik Toleransı', h: 'üst delik Ø = pim Ø + tolerans', v: 0.3, min: 0, step: 0.05 },
-    { k: 'holeExtra', l: 'Üst Delik Ek Derinliği', v: 1.0, min: 0, step: 0.1 },
     { k: 'pinChamfer', l: 'Pim Ucu Pahı (45°)', v: 0.6, min: 0, step: 0.1 },
+    { k: 'pinTol', l: 'Pim-Delik Toleransı', h: 'üst delik Ø = pim Ø + tolerans', v: 0.3, min: 0, step: 0.05 },
+    { k: 'upperHoleMode', l: 'Üst kalıp pim deliği', v: 'blind', type: 'select', opts: [['blind', 'Kör delik'], ['through', 'Boydan boya (patlak)']] },
+    { k: 'holeExtra', l: 'Üst Delik Ek Derinliği', h: 'derinlik = pim boyu + bu', v: 1.0, min: 0, step: 0.1, show: show.upBlind },
+    { k: 'holeChamfer', l: 'Delik Ağzı Pahı', h: 'pim kolay girer', v: 0.4, min: 0, step: 0.1 },
+    { k: 'lowerHoleMode', l: 'Alt kalıp pim deliği', v: 'blind', type: 'select', opts: [['blind', 'Kör delik'], ['through', 'Boydan boya (pim alttan itilir)']], show: show.steel },
     { k: 'pressFit', l: 'Alt Delik Sıkı Geçme Payı', v: 0.1, min: 0, step: 0.05, show: show.steel },
-    { k: 'lowerPinDepth', l: 'Alt Pim Deliği Derinliği', v: 5, min: 1, step: 0.5, show: show.steel },
+    { k: 'lowerPinDepth', l: 'Alt Pim Deliği Derinliği', v: 5, min: 1, step: 0.5, show: show.steelBlind },
   ]},
-  { title: '7 · Kabartma & Kağıt', id: 'emboss', fields: [
-    { k: 'embossH', l: 'Erkek Kabartma Yüksekliği', v: 0.7, min: 0.1, step: 0.05 },
-    { k: 'draft', l: 'Kabartma Kenar Eğimi', h: 'dikeyden açı; kağıt yırtılmaz', v: 20, min: 0, step: 1, unit: '°' },
-    { k: 'paperOff', l: 'Kağıt Kalınlığı / Dişi Offset', h: 'bilet kartonu ≈ 0.25–0.3', v: 0.3, min: 0, step: 0.05 },
-    { k: 'cavityD', l: 'Dişi Oyuk Derinliği', v: 1.0, min: 0.1, step: 0.05 },
-  ]},
-  { title: '8 · Kalıp Arkası Yazı', id: 'back', fields: [
+  { title: '9 · Kalıp Arkası Yazı', id: 'back', fields: [
     { k: 'backOn', l: 'Arkaya ALT / ÜST yaz', v: true, type: 'bool' },
     { k: 'backLabel', l: 'Ek etiket', h: 'ör. tasarım adı (boş olabilir)', v: '', type: 'text', show: show.back },
     { k: 'backH', l: 'Yazı Yüksekliği', v: 3.5, min: 1, step: 0.5, show: show.back },
-    { k: 'backDepth', l: 'Kazıma Derinliği', h: 'sığ: baskıyı zorlamaz', v: 0.4, min: 0.1, step: 0.05, show: show.back },
+    { k: 'backDepth', l: 'Kazıma Derinliği', h: 'sığ: baskıyı zorlamaz', v: 0.4, min: 0.1, step: 0.04, show: show.back },
   ]},
-  { title: '9 · Bilet Önizleme', id: 'ticket', open: false, fields: [
+  { title: '10 · Bilet Önizleme', id: 'ticket', open: false, fields: [
     { k: 'ticketW', l: 'Bilet Genişliği', v: 150, min: 10, step: 1 },
     { k: 'ticketH', l: 'Bilet Yüksekliği', v: 60, min: 10, step: 1 },
   ]},
@@ -815,6 +899,8 @@ function buildPanel() {
       if (f.type === 'bool') P[k] = el.checked;
       else if (f.type === 'select' || f.type === 'text' || f.type === 'textarea') P[k] = el.value;
       else { let v = parseFloat(el.value); if (!isFinite(v)) return; if (f.min !== undefined && v < f.min) v = f.min; P[k] = v; }
+      if (k === 'paper' && PAPERS[P.paper]) { Object.assign(P, { paperOff: PAPERS[P.paper].paperOff, embossH: PAPERS[P.paper].embossH, cavityD: PAPERS[P.paper].cavityD }); syncPanel(); }
+      if (['paperOff', 'embossH', 'cavityD'].includes(k)) { P.paper = 'custom'; const ps = document.getElementById('p_paper'); if (ps) ps.value = 'custom'; }
       onParamsChanged();
     });
   }
@@ -840,7 +926,7 @@ function updateVisibility() {
 }
 
 /* ---------- Kaydetme ---------- */
-const LS_KEY = 'stampmaker.v2';
+const LS_KEY = 'stampmaker.v3';
 let customSVG = null, customSVGName = '';
 function save() {
   try { localStorage.setItem(LS_KEY, JSON.stringify({ params: P, svg: customSVG && customSVG.length < 400000 ? customSVG : null, svgName: customSVGName })); } catch (e) {}
@@ -890,26 +976,175 @@ function groovePoly(G) {
   return [pt(a, a), pt(G.W + 1, a), pt(G.W + 1, b), pt(b, b), pt(b, G.L + 1), pt(a, G.L + 1)];
 }
 
+/* ---------- Katman yüksekliği ve eğim ---------- */
+const LH = () => Math.max(0.02, P.layerH || 0.08);
+const snap = v => Math.max(LH(), Math.round(v / LH() - 1e-9) * LH());
+const effH = () => snap(P.embossH);
+const effCD = () => Math.max(snap(P.cavityD), LH());
+const tanD = () => Math.tan(THREE.MathUtils.degToRad(Math.min(Math.max(P.draft, 0), 60)));
+// [h0,h1] kademe listesi (mm). Eğim varsa her kademe bir yazıcı katmanı kalınlığında.
+function stepList(H) {
+  if (P.draft <= 0) return [[0, H]];
+  let n = Math.max(1, Math.round(H / LH()));
+  const group = Math.ceil(n / 14);          // performans için en fazla ~14 kademe
+  const out = [];
+  for (let k = 0; k < n; k += group) out.push([H * k / n, H * Math.min(n, k + group) / n]);
+  return out;
+}
+
+/* ---------- Büyük dolu alanlar: kontur / tarama ---------- */
+function bigCore(paths) {
+  const seeds = offsetPaths(paths, -U(P.bigD / 2));
+  if (!seeds.length) return { seeds, core: [] };
+  const core = offsetPaths(paths, -U(P.outlineW));
+  const shapes = treeShapes(clipOp(CL.ClipType.ctUnion, core, null, NZ, true))
+    .filter(sh => interArea(shapesToPaths([sh]), seeds) > 0);
+  return { seeds, core: shapesToPaths(shapes) };
+}
+function hatchStripes(paths) {
+  const b = bounds(paths);
+  const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2, R = Math.hypot(b.x1 - b.x0, b.y1 - b.y0) / 2 + U(1);
+  const a = THREE.MathUtils.degToRad(P.hatchA), ux = Math.cos(a), uy = Math.sin(a), vx = -uy, vy = ux;
+  const hw = U(P.hatchW) / 2, step = U(Math.max(P.hatchS, P.hatchW + 0.3));
+  const out = [];
+  for (let t = -R; t <= R; t += step) {
+    const p = (s, w) => ({ X: Math.round(cx + vx * (t + w) + ux * s), Y: Math.round(cy + vy * (t + w) + uy * s) });
+    out.push([p(-R, -hw), p(R, -hw), p(R, hw), p(-R, hw)]);
+  }
+  return out;
+}
+function applyFill(paths) {
+  if (P.fillMode === 'solid' || !paths.length) return { paths, changed: 0, core: [] };
+  const { core } = bigCore(paths);
+  if (!core.length) return { paths, changed: 0, core: [] };
+  const rest = difference(paths, core);
+  if (P.fillMode === 'outline') return { paths: rest, changed: areaMM2(core), core };
+  const stripes = intersection(offsetPaths(core, U(P.outlineW / 2)), hatchStripes(core), 2000);
+  return { paths: region(rest.concat(stripes), 2000), changed: areaMM2(core), core };
+}
+
+/* ---------- Kompozisyon: logo + yazı + halkalar, seviyelere ayrılmış ---------- */
 let rawLogo = null;
 function composeDesign(font, G) {
-  const parts = [];
+  const items = [];   // {frac, paths}  (tasarım merkezi = 0,0)
   if (P.logoOn && rawLogo) {
     const b = rawLogo.b, k = (P.logoW * S) / (b.x1 - b.x0);
     const mx = (b.x0 + b.x1) / 2, my = (b.y0 + b.y1) / 2;
-    parts.push(...rawLogo.paths.map(p => p.map(v => ({ X: Math.round((v.X - mx) * k + P.logoDX * S), Y: Math.round((v.Y - my) * k + P.logoDY * S) }))));
+    for (const lv of rawLogo.levels) items.push({ frac: P.multiLevel ? lv.frac : 1,
+      paths: lv.paths.map(p => p.map(v => ({ X: Math.round((v.X - mx) * k + P.logoDX * S), Y: Math.round((v.Y - my) * k + P.logoDY * S) }))) });
   }
+  const circ = P.textMode === 'circle';
   if (font && P.textMode !== 'none' && P.text.trim()) {
-    if (P.textMode === 'circle') parts.push(...circleText(font, P.text.split('\n'), P.capH, P.letterSp, P.textR));
-    else parts.push(...flatText(font, P.text, P.capH, P.letterSp, P.lineSp, P.align, P.textDX, P.textDY).paths);
+    const paths = circ
+      ? translate(circleText(font, P.text.split('\n'), P.capH, P.letterSp, P.textR), U(P.textDX), U(P.textDY))
+      : flatText(font, P.text, P.capH, P.letterSp, P.lineSp, P.align, P.textDX, P.textDY).paths;
+    items.push({ frac: P.textLevel / 100, paths });
   }
-  if (P.frameOn) parts.push(...ring(P.frameR, P.frameT));
-  if (P.innerOn) parts.push(...ring(P.innerR, P.innerT));
-  let comp = region(parts, 2000);
-  if (!comp.length) return { paths: [], w: 0, h: 0 };
-  const b = bounds(comp);
-  if (P.mirror) comp = comp.map(p => p.map(v => ({ X: b.x0 + b.x1 - v.X, Y: v.Y })).reverse());
-  const dx = U(G.ox + P.designX) - b.x0, dy = U(G.oy + P.designY) - b.y0;
-  return { paths: translate(comp, dx, dy), w: (b.x1 - b.x0) / S, h: (b.y1 - b.y0) / S };
+  const rdx = circ ? U(P.textDX) : 0, rdy = circ ? U(P.textDY) : 0;
+  if (P.frameOn) items.push({ frac: P.ringLevel / 100, paths: translate(ring(P.frameR, P.frameT), rdx, rdy) });
+  if (P.innerOn) items.push({ frac: P.ringLevel / 100, paths: translate(ring(P.innerR, P.innerT), rdx, rdy) });
+
+  // aynı seviyeleri birleştir, büyük alan dolgusunu uygula
+  const byFrac = new Map();
+  for (const it of items) {
+    const f = Math.min(1, Math.max(0.05, Math.round(it.frac * 100) / 100));
+    byFrac.set(f, (byFrac.get(f) || []).concat(it.paths));
+  }
+  let levels = [], filled = 0, cores = [];
+  for (const [frac, paths] of byFrac) {
+    const fr = applyFill(region(paths, 2000));
+    filled += fr.changed; cores = cores.concat(fr.core);
+    if (fr.paths.length) levels.push({ frac, paths: fr.paths });
+  }
+  // Üst üste binen seviyelerde yüksek olan kazanır: alçak seviyeden yüksek seviyenin alanı çıkarılır
+  levels.sort((a, b) => b.frac - a.frac);
+  let above = [];
+  levels = levels.map(l => {
+    const own = above.length ? difference(l.paths, above, 2000) : l.paths;
+    above = above.concat(l.paths);
+    return { frac: l.frac, paths: own };
+  }).filter(l => l.paths.length);
+  let all = region(levels.flatMap(l => l.paths), 2000);
+  const bigRaw = P.fillMode === 'solid' ? areaMM2(bigCore(all).seeds) : 0;
+  if (!all.length) return { levels: [], all: [], cores: [], w: 0, h: 0, bx: [0, 0, 0, 0], filled, bigRaw };
+  const b = bounds(all);
+  const bx = [b.x0 / S, b.y0 / S, b.x1 / S, b.y1 / S];
+  const mir = paths => paths.map(p => p.map(v => ({ X: -v.X, Y: v.Y })).reverse());
+  const ox = U(G.ox + P.designX), oy = U(G.oy + P.designY);
+  const place = paths => translate(P.mirror ? mir(paths) : paths, ox, oy);
+  levels = levels.map(l => ({ frac: l.frac, paths: place(l.paths) }));
+  all = place(all);
+  cores = place(cores);
+  if (P.mirror) { bx[0] = -b.x1 / S; bx[2] = -b.x0 / S; }
+  return { levels, all, cores, w: bx[2] - bx[0], h: bx[3] - bx[1], bx, filled, bigRaw };
+}
+function centroid(paths) {
+  let A = 0, cx = 0, cy = 0;
+  for (const p of paths) for (let i = 0, n = p.length; i < n; i++) {
+    const a = p[i], b = p[(i + 1) % n], c = a.X * b.Y - b.X * a.Y;
+    A += c; cx += (a.X + b.X) * c; cy += (a.Y + b.Y) * c;
+  }
+  if (Math.abs(A) < 1) return null;
+  return { x: cx / (3 * A) / S, y: cy / (3 * A) / S };
+}
+
+/* ---------- Pres ekseni (M8 + Ø12) ---------- */
+function computeAxis(comp, G) {
+  const spec = THREADS[P.threadSize] || THREADS.M8;
+  const rUp = P.upperType === 'nut' ? (spec.af + P.nutClear) / Math.sqrt(3) : (spec.d + P.threadClear) / 2 + 0.6;
+  const rLow = P.lowerType === 'hole' ? P.lowerHoleD / 2 : P.pressPinD / 2;
+  const Rc = Math.max(rUp, rLow) + 1.5;
+  const box = { x0: G.ox + P.wallGap + Rc, x1: G.W - Rc, y0: G.oy + P.wallGap + Rc, y1: G.L - Rc };
+  const load = centroid(comp.all) || { x: G.cx, y: G.cy };
+  let x, y;
+  if (P.axisMode === 'manual') { x = P.axisX; y = P.axisY; }
+  else if (P.axisMode === 'center') { x = G.cx; y = G.cy; }
+  else { x = load.x; y = load.y; }
+  const inside = x >= box.x0 - 1e-6 && x <= box.x1 + 1e-6 && y >= box.y0 - 1e-6 && y <= box.y1 + 1e-6;
+  if (P.axisMode === 'auto' && box.x1 >= box.x0 && box.y1 >= box.y0) {
+    x = Math.min(Math.max(x, box.x0), box.x1); y = Math.min(Math.max(y, box.y0), box.y1);
+  }
+  x = Math.round(x * 100) / 100; y = Math.round(y * 100) / 100;
+  return { x, y, load, offset: Math.hypot(load.x - x, load.y - y), inside: P.axisMode === 'auto' ? true : inside, box, Rc };
+}
+
+/* ---------- Erkek desen (kademeli eğim) ve dişi oyuk ---------- */
+// Desen katıları: zBase'ten dir yönünde yükselir; tabanda geniş, tepede dar.
+function patternSolids(levels, zBase, dir) {
+  const out = [], tz = tanD(), H = effH();
+  for (const lv of levels) {
+    const Ht = snap(H * lv.frac);
+    for (const [h0, h1] of stepList(Ht)) {
+      const off = Ht * tz / 2 - ((h0 + h1) / 2) * tz;
+      const reg = offsetPaths(lv.paths, U(off));
+      if (!reg.length) continue;
+      const za = zBase + dir * U(h0), zb = zBase + dir * U(h1);
+      out.push({ z0: Math.min(za, zb), z1: Math.max(za, zb), paths: reg });
+    }
+  }
+  return out;
+}
+// Oyuk kesimleri: yüzey zFace'ten dir yönünde derinleşir; ağızda geniş.
+function cavityCuts(levels, zFace, dir) {
+  const out = [], tz = tanD(), H = effH(), cd = effCD(), p = P.paperOff;
+  let face = [];
+  for (const lv of levels) {
+    const Ht = snap(H * lv.frac);
+    const depth = Math.max(LH(), snap(cd - (H - Ht)));
+    stepList(depth).forEach(([s0, s1], j) => {
+      const h = Math.min((s0 + s1) / 2 + p, Ht);
+      const reg = offsetPaths(lv.paths, U(p + Ht * tz / 2 - h * tz));
+      if (!reg.length) return;
+      if (j === 0) face = face.concat(reg);
+      const za = zFace + dir * U(s0), zb = zFace + dir * U(s1);
+      out.push({ z0: Math.min(za, zb), z1: Math.max(za, zb), paths: reg });
+    });
+  }
+  return { cuts: out, face: region(face) };
+}
+function levelInfo(levels) {
+  const H = effH(), cd = effCD();
+  return levels.map(l => { const Ht = snap(H * l.frac); return { frac: l.frac, Ht, depth: Math.max(LH(), snap(cd - (H - Ht))) }; });
 }
 function backText(font, str, cx, cy, mirror, maxW) {
   if (!font || !str) return [];
@@ -918,39 +1153,31 @@ function backText(font, str, cx, cy, mirror, maxW) {
   if (w > maxW) capH *= maxW / w;
   return flatText(font, str, capH, 0.2, 1.3, 'center', cx, cy, mirror).paths;
 }
-function embossSteps(H) { return P.draft > 0 ? Math.max(2, Math.min(8, Math.ceil(H / 0.15))) : 1; }
-const tanD = () => Math.tan(THREE.MathUtils.degToRad(Math.min(P.draft, 60)));
-// Erkek kabartmanın yükseklik h'deki ofseti (nominal tasarım orta yükseklikte)
-const maleOff = h => P.embossH * tanD() / 2 - Math.min(Math.max(h, 0), P.embossH) * tanD();
+// Arka yazıyı pres bağlantısından uzak kenara koy
+const backY = (G, AX) => AX.y > G.L / 2 ? G.L * 0.17 : G.L * 0.83;
 
-function buildLower(design, G, font) {
+function buildLower(comp, G, font, AX) {
   const T = P.lowerT;
   const base = P.lowerType === 'pin' ? P.pressPinL : 0;
   const zTop = base + T;
-  const solids = [], cuts = [], profiles = [];
-  if (P.lowerType === 'pin') solids.push({ z0: 0, z1: U(base), paths: [circle(G.cx, G.cy, P.pressPinD / 2, 96)] });
+  const solids = [], cuts = [], profiles = [], warns = [];
+  if (P.lowerType === 'pin') solids.push({ z0: 0, z1: U(base), paths: [circle(AX.x, AX.y, P.pressPinD / 2, 96)] });
   solids.push({ z0: U(base), z1: U(zTop), paths: [rect(0, 0, G.W, G.L)] });
   let lhd = 0;
   if (P.lowerType === 'hole') {
     lhd = Math.min(P.lowerHoleDepth, T - 1);
-    cuts.push({ z0: 0, z1: U(lhd), paths: [circle(G.cx, G.cy, P.lowerHoleD / 2, 96, true)] });
+    if (lhd < P.lowerHoleDepth) warns.push(`Alt pres deliği derinliği ${lhd.toFixed(1)} mm ile sınırlandı (plakada ≥1 mm et).`);
+    cuts.push({ z0: 0, z1: U(lhd), paths: [circle(AX.x, AX.y, P.lowerHoleD / 2, 96, true)] });
   }
-  // Alt yüzeye ayna yazı (alttan bakınca okunur)
   let back = [];
   if (P.backOn) {
-    back = backText(font, 'ALT' + (P.backLabel ? ' · ' + P.backLabel : ''), G.cx, G.L * 0.17, true, G.W - 10);
-    if (back.length) cuts.push({ z0: U(base), z1: U(base + Math.min(P.backDepth, T / 3)), paths: back });
+    back = backText(font, 'ALT' + (P.backLabel ? ' · ' + P.backLabel : ''), G.cx, backY(G, AX), true, G.W - 10);
+    if (back.length) cuts.push({ z0: U(base), z1: U(base + Math.min(snap(P.backDepth), T / 3)), paths: back });
   }
-  // Üst özellikler
   solids.push({ z0: U(zTop), z1: U(zTop + P.wallH), paths: [wallPoly(G)] });
-  const n = embossSteps(P.embossH);
-  const embossRegions = [];
-  if (design.length) for (let k = 0; k < n; k++) {
-    const h0 = P.embossH * k / n, h1 = P.embossH * (k + 1) / n;
-    const reg = offsetPaths(design, U(maleOff((h0 + h1) / 2)));
-    embossRegions.push(reg);
-    if (reg.length) solids.push({ z0: U(zTop + h0), z1: U(zTop + h1), paths: reg });
-  }
+  let cavFace = [];
+  if (P.relief === 'emboss') solids.push(...patternSolids(comp.levels, U(zTop), +1));
+  else { const c = cavityCuts(comp.levels, U(zTop), -1); cuts.push(...c.cuts); cavFace = c.face; }
   const r = P.guideD / 2;
   if (P.guideType === 'printed') {
     const cham = Math.min(P.pinChamfer, r * 0.8, P.guideH * 0.5);
@@ -960,72 +1187,91 @@ function buildLower(design, G, font) {
       if (cham > 0) profiles.push(frustum(p.x, p.y, r, r - cham, prismTop, zTop + P.guideH));
     }
   } else {
-    const d = Math.min(P.lowerPinDepth, T - 1.5);
-    cuts.push({ z0: U(zTop - d), z1: U(zTop), paths: G.pins.map(p => circle(p.x, p.y, (P.guideD + P.pressFit) / 2, 48, true)) });
+    const rh = (P.guideD + P.pressFit) / 2;
+    const c = Math.min(0.3, P.holeChamfer);
+    let d;
+    if (P.lowerHoleMode === 'through') d = T;
+    else { d = Math.min(P.lowerPinDepth, T - 1.2); if (d < P.lowerPinDepth) warns.push(`Alt pim deliği derinliği ${d.toFixed(1)} mm ile sınırlandı; boydan boya seçebilirsiniz.`); }
+    cuts.push({ z0: U(zTop - d), z1: U(zTop - c), paths: G.pins.map(p => circle(p.x, p.y, rh, 48, true)) });
+    if (c > 0) for (const p of G.pins) profiles.push(holeCham(p.x, p.y, rh, c, zTop, -1));
+    lower_pinDepth = d;
   }
   const res = stack({ solids, cuts, profiles });
-  Object.assign(res, { zTop, lhd, back, embossRegions, height: zTop + Math.max(P.wallH, P.embossH, P.guideType === 'printed' ? P.guideH : 0) });
+  const li = levelInfo(comp.levels);
+  Object.assign(res, { zTop, lhd, back, cavFace, warns, levels: li,
+    zone: P.relief === 'emboss' ? { z0: zTop, z1: zTop + effH(), keep: li.map(l => zTop + l.Ht) } : { z0: zTop - effCD(), z1: zTop, keep: li.map(l => zTop - l.depth) },
+    height: zTop + Math.max(P.wallH, P.relief === 'emboss' ? effH() : 0, P.guideType === 'printed' ? P.guideH : 0) });
   return res;
 }
+let lower_pinDepth = 0;
 
-function buildUpper(design, G, font) {
+function buildUpper(comp, G, font, AX) {
   const T = P.upperT;
   const spec = THREADS[P.threadSize] || THREADS.M8;
   const solids = [{ z0: 0, z1: U(T), paths: [rect(0, 0, G.W, G.L)] }];
-  const cuts = [], profiles = [];
-  // Dişi oyuk (eğimli kademeler): yüzde en geniş
-  const cd = Math.min(P.cavityD, T - 1);
-  const m = P.draft > 0 ? Math.max(2, Math.min(10, Math.ceil(cd / 0.15))) : 1;
-  let cavFace = [];
-  if (design.length) for (let j = 0; j < m; j++) {
-    const s0 = cd * j / m, s1 = cd * (j + 1) / m;
-    const reg = offsetPaths(design, U(P.paperOff + maleOff((s0 + s1) / 2 + P.paperOff)));
-    if (j === 0) cavFace = reg;
-    if (reg.length) cuts.push({ z0: U(s0), z1: U(s1), paths: reg });
+  const cuts = [], profiles = [], warns = [];
+  const emb = P.relief === 'emboss';
+  let cavFace = [], cd = 0;
+  if (emb) { const c = cavityCuts(comp.levels, 0, +1); cuts.push(...c.cuts); cavFace = c.face; cd = effCD(); }
+  else solids.push(...patternSolids(comp.levels, 0, -1));
+  // Kılavuz delikleri (ağız pahlı), L-duvar kanalı
+  const rh = G.holeD / 2;
+  const c = Math.min(P.holeChamfer, 1);
+  let hd;
+  if (P.upperHoleMode === 'through') hd = T;
+  else {
+    hd = Math.min(P.guideH + P.holeExtra, T - 0.8);
+    if (hd < P.guideH + P.holeExtra - 1e-6) warns.push(`Üst pim deliği derinliği ${hd.toFixed(1)} mm ile sınırlandı (plaka ${T} mm). Boydan boya seçebilir veya plakayı kalınlaştırabilirsiniz.`);
+    if (hd < P.guideH + 0.2) warns.push('Üst pim deliği pimden kısa: kalıp tam kapanmaz!');
   }
-  // Kılavuz delikleri ve L-duvar kanalı
-  const hd = Math.min(P.guideH + P.holeExtra, T - 0.8);
-  const holes = G.pins.map(p => circle(p.x, p.y, G.holeD / 2, 48, true));
-  cuts.push({ z0: 0, z1: U(hd), paths: holes });
+  const holes = G.pins.map(p => circle(p.x, p.y, rh, 48, true));
+  cuts.push({ z0: U(c), z1: U(hd), paths: holes });
+  if (c > 0) for (const p of G.pins) profiles.push(holeCham(p.x, p.y, rh, c, 0, +1));
   const gd = Math.min(Math.max(P.wallH - P.paperOff, 0) + P.grooveClear, T - 1);
   cuts.push({ z0: 0, z1: U(gd), paths: [groovePoly(G)] });
-  // Bağlantı
-  let nd = 0, thd = 0, clamped = false;
-  const hex = hexagon(G.cx, G.cy, spec.af + P.nutClear);
+  // Pres bağlantısı
+  let nd = 0, thd = 0;
+  const hex = hexagon(AX.x, AX.y, spec.af + P.nutClear);
   if (P.upperType === 'nut') {
     nd = Math.min(P.nutDepth, T - 0.8);
     cuts.push({ z0: U(T - nd), z1: U(T), paths: [hex] });
   } else if (P.upperType === 'thread') {
-    thd = Math.min(P.thrDepth, T - 0.5, T - cd - 0.6);
-    if (thd < P.thrDepth) clamped = true;
-    if (thd > 0.5) profiles.push(thread(G.cx, G.cy, 'int', spec, P.threadClear, T - thd, T, { top: true, cham: 0.6 }));
+    thd = Math.min(P.thrDepth, T - 0.5, emb ? T - cd - 0.6 : T - 0.5);
+    if (thd < P.thrDepth) warns.push(`Dişli delik derinliği ${thd.toFixed(1)} mm ile sınırlandı. Üst plakayı kalınlaştırın.`);
+    if (thd > 0.5) profiles.push(thread(AX.x, AX.y, 'int', spec, P.threadClear, T - thd, T, { top: true, cham: 0.6 }));
   } else {
-    profiles.push(thread(G.cx, G.cy, 'ext', spec, P.threadClear, T, T + P.studLen, { top: true, cham: Math.min(0.8, spec.p) }));
+    profiles.push(thread(AX.x, AX.y, 'ext', spec, P.threadClear, T, T + P.studLen, { top: true, cham: Math.min(0.8, spec.p) }));
   }
-  // Arka yüze yazı (montajda üstten okunur)
   let back = [];
   if (P.backOn) {
-    back = backText(font, 'ÜST' + (P.backLabel ? ' · ' + P.backLabel : ''), G.cx, G.L * 0.17, false, G.W - 10);
-    if (back.length) cuts.push({ z0: U(T - Math.min(P.backDepth, T / 3)), z1: U(T), paths: back });
+    back = backText(font, 'ÜST' + (P.backLabel ? ' · ' + P.backLabel : ''), G.cx, backY(G, AX), false, G.W - 10);
+    if (back.length) cuts.push({ z0: U(T - Math.min(snap(P.backDepth), T / 3)), z1: U(T), paths: back });
   }
   const res = stack({ solids, cuts, profiles });
-  Object.assign(res, { cavFace, holes, hex: P.upperType === 'nut' ? [hex] : [], nd, thd, hd, gd, cd, clamped, back, spec,
-    height: T + (P.upperType === 'stud' ? P.studLen : 0), faceDown: P.upperType === 'stud' });
+  const li = levelInfo(comp.levels);
+  const faceDown = P.upperType === 'stud' && emb;
+  Object.assign(res, { cavFace, holes, hex: P.upperType === 'nut' ? [hex] : [], nd, thd, hd, gd, cd, back, spec, warns, faceDown, levels: li,
+    zone: emb ? { z0: 0, z1: effCD(), keep: li.map(l => l.depth) } : { z0: -effH(), z1: 0, keep: li.map(l => -l.Ht) },
+    height: res.zMax - res.zMin });
   return res;
+}
+// Üst kalıbın baskı yönüne dönüşümü: yüz aşağı (öteleme) ya da X ekseni etrafında 180°
+function upperPrintMap(d) {
+  return d.faceDown ? (x, y, z) => [x, y, z - d.zMin] : (x, y, z) => [x, P.baseL - y, d.zMax - z];
 }
 
 // Ek parçalar (dişi seçeneklerin içine basılacak parçalar)
-function buildInserts(G, lower, upper) {
+function buildInserts(G, lower, upper, AX) {
   const list = [];
   const spec = upper.spec;
   const T = P.upperT;
   if (P.lowerType === 'hole') {
     const len = lower.lhd - 0.3 + P.pressPinL;
     list.push({ key: 'presspin', label: 'Pres pimi', file: 'ek_pres_pimi.stl', res: pinPart(P.pressPinD / 2, len, 0.6, 0.6, 96),
-      mount: 'lower', at: [G.cx, G.cy, -P.pressPinL] });
+      mount: 'lower', at: [AX.x, AX.y, -P.pressPinL] });
   }
   if (P.guideType === 'steel') {
-    const d = Math.min(P.lowerPinDepth, P.lowerT - 1.5);
+    const d = lower_pinDepth;
     const res = pinPart(P.guideD / 2, d + P.guideH, Math.min(P.pinChamfer, P.guideD * 0.4), 0.3);
     G.pins.forEach((p, i) => list.push({ key: 'guide' + i, label: 'Kılavuz pimi ' + (i + 1), file: `ek_kilavuz_pimi_${i + 1}.stl`, res,
       mount: 'lower', at: [p.x, p.y, lower.zTop - d] }));
@@ -1034,17 +1280,17 @@ function buildInserts(G, lower, upper) {
     const sl = upper.thd - 0.5 + P.studLen;
     list.push({ key: 'stud', label: 'Saplama ' + P.threadSize, file: `ek_saplama_${P.threadSize}.stl`,
       res: stack({ profiles: [thread(0, 0, 'ext', spec, P.threadClear, 0, sl, { top: true, bot: true, cham: Math.min(0.8, spec.p) })] }),
-      mount: 'upper', at: [G.cx, G.cy, T - upper.thd + 0.5] });
+      mount: 'upper', at: [AX.x, AX.y, T - upper.thd + 0.5] });
   }
   if (P.upperType === 'nut') {
     const h = upper.nd - 0.3;
     list.push({ key: 'nut', label: 'Somun ' + P.threadSize, file: `ek_somun_${P.threadSize}.stl`,
       res: stack({ solids: [{ z0: 0, z1: U(h), paths: [hexagon(0, 0, spec.af)] }], profiles: [thread(0, 0, 'int', spec, P.threadClear, 0, h, { top: true, bot: true, cham: 0.4 })] }),
-      mount: 'upper', at: [G.cx, G.cy, T - upper.nd] });
+      mount: 'upper', at: [AX.x, AX.y, T - upper.nd] });
     const sl = h + P.studLen;
     list.push({ key: 'stud', label: 'Saplama ' + P.threadSize, file: `ek_saplama_${P.threadSize}.stl`,
       res: stack({ profiles: [thread(0, 0, 'ext', spec, P.threadClear, 0, sl, { top: true, bot: true, cham: Math.min(0.8, spec.p) })] }),
-      mount: 'upper', at: [G.cx, G.cy, T - upper.nd] });
+      mount: 'upper', at: [AX.x, AX.y, T - upper.nd] });
   }
   return list;
 }
@@ -1113,6 +1359,24 @@ function makePart(mats) {
   group.add(mesh, back, edges, wire);
   return { group, mats, mesh, back, edges, wire, data: null };
 }
+// Eğim kademelerinin ara kenar çizgilerini gizle (görüntü sadeleşir, dosya değişmez)
+function filterStepEdges(eg, zone) {
+  if (!zone) return eg;
+  const a = eg.attributes.position.array, out = [];
+  const eps = 1e-4, inZ = z => z > zone.z0 + eps && z < zone.z1 - eps;
+  const kept = z => zone.keep.some(k => Math.abs(k - z) < eps);
+  for (let i = 0; i < a.length; i += 6) {
+    const z1 = a[i + 2], z2 = a[i + 5];
+    const both = inZ(z1) && inZ(z2);
+    if (both && !(Math.abs(z1 - z2) < eps && kept(z1))) continue;
+    if (inZ(z1) !== inZ(z2) && Math.abs(z1 - z2) < LH() * 1.01 && !kept(z1) && !kept(z2)) continue;
+    for (let k = 0; k < 6; k++) out.push(a[i + k]);
+  }
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.Float32BufferAttribute(out, 3));
+  eg.dispose();
+  return g;
+}
 function setPartGeometry(part, res) {
   part.data = res;
   const g = new THREE.BufferGeometry();
@@ -1122,7 +1386,7 @@ function setPartGeometry(part, res) {
   if (res.triCount > 40000) disp.computeVertexNormals();
   for (const o of [part.mesh, part.edges, part.wire]) o.geometry.dispose();
   part.mesh.geometry = disp; part.back.geometry = disp;
-  part.edges.geometry = new THREE.EdgesGeometry(g, 25);
+  part.edges.geometry = filterStepEdges(new THREE.EdgesGeometry(g, 25), res.zone);
   part.wire.geometry = g;
 }
 const maleMats = makeMats(0x5b8def), femaleMats = makeMats(0xf0a43a), insMats = makeMats(0xa5adb8);
@@ -1154,8 +1418,20 @@ function shapeMesh(paths, z, color, opacity) {
 
 let mode = 0, lastMode = -1;
 const openRange = document.getElementById('openRange'), cutRange = document.getElementById('cutRange');
-const wireChk = document.getElementById('wireChk'), thinChk = document.getElementById('thinChk'), ticketChk = document.getElementById('ticketChk');
-let thinMesh = null, ribMesh = null, ticketMesh = null, ticketEdge = null;
+const wireChk = document.getElementById('wireChk'), thinChk = document.getElementById('thinChk'), ticketChk = document.getElementById('ticketChk'), axisChk = document.getElementById('axisChk');
+let thinMesh = null, ribMesh = null, ticketMesh = null, ticketEdge = null, axisMarks = null, curAxis = null;
+// Pres ekseni (camgöbeği çizgi) ve yük merkezi (macenta) işaretleri — alt kalıp koordinatında
+function makeAxisMarks(AX, zTop) {
+  const g = new THREE.Group();
+  const lineG = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(AX.x, AX.y, -14), new THREE.Vector3(AX.x, AX.y, zTop + 22)]);
+  g.add(new THREE.Line(lineG, new THREE.LineBasicMaterial({ color: 0x22d3ee, depthTest: false, transparent: true, opacity: 0.9 })));
+  const ringG = new THREE.RingGeometry(0.8, 1.1, 32); ringG.translate(AX.x, AX.y, zTop + 0.05);
+  g.add(new THREE.Mesh(ringG, new THREE.MeshBasicMaterial({ color: 0x22d3ee, depthTest: false, transparent: true, opacity: 0.85, side: THREE.DoubleSide })));
+  const dotG = new THREE.CircleGeometry(0.5, 24); dotG.translate(AX.load.x, AX.load.y, zTop + 0.06);
+  g.add(new THREE.Mesh(dotG, new THREE.MeshBasicMaterial({ color: 0xff3fd2, depthTest: false, transparent: true, opacity: 0.85, side: THREE.DoubleSide })));
+  g.renderOrder = 10; g.children.forEach(c => c.renderOrder = 10);
+  return g;
+}
 
 function applyMode(resetCam = false) {
   if (!male.data || !female.data) return;
@@ -1166,14 +1442,15 @@ function applyMode(resetCam = false) {
   const zFace = male.data.zTop + P.paperOff + open;
   female.group.rotation.set(0, 0, 0);
   if (assembled) female.group.position.set(0, 0, zFace);
-  else if (female.data.faceDown) female.group.position.set(G.W + 15, 0, 0);
-  else { female.group.rotation.set(Math.PI, 0, 0); female.group.position.set(G.W + 15, G.L, T); }
+  else if (female.data.faceDown) female.group.position.set(G.W + 15, 0, -female.data.zMin);
+  else { female.group.rotation.set(Math.PI, 0, 0); female.group.position.set(G.W + 15, G.L, female.data.zMax); }
 
   const d = new THREE.Vector2(G.pins[1].x - G.pins[0].x, G.pins[1].y - G.pins[0].y).normalize();
   const n = new THREE.Vector3(-d.y, d.x, 0); if (n.x + n.y < 0) n.negate();
   const off = parseFloat(cutRange.value);
   section.normal.copy(n);
-  section.constant = -(n.x * G.cx + n.y * G.cy) - off;
+  const ax = curAxis || { x: G.cx, y: G.cy };
+  section.constant = -(n.x * ax.x + n.y * ax.y) - off;
 
   const sect = mode === 2;
   const planes = sect ? [section] : [];
@@ -1187,6 +1464,7 @@ function applyMode(resetCam = false) {
     part.back.visible = sect; part.wire.visible = sect && wireChk.checked;
   }
   for (const ip of insertParts) { ip.row.group.visible = !assembled; ip.mounted.group.visible = assembled; }
+  if (axisMarks) axisMarks.visible = axisChk.checked;
   if (thinMesh) thinMesh.visible = thinChk.checked;
   if (ribMesh) ribMesh.visible = thinChk.checked;
   if (ticketMesh) { ticketMesh.visible = ticketChk.checked && assembled; ticketEdge.visible = ticketChk.checked && assembled; }
@@ -1197,7 +1475,7 @@ function applyMode(resetCam = false) {
   document.getElementById('optOpen').style.display = assembled ? 'flex' : 'none';
   document.getElementById('optHint').textContent = mode === 0
     ? 'Parçalar baskı tablasındaki yönleriyle. Gri parçalar ek (ayrı basılan) parçalardır.'
-    : sect ? 'Kesit iki kılavuz piminden ve merkezden geçer. Kırmızı = kesilen iç malzeme.'
+    : sect ? 'Kesit pres ekseninden, kılavuz pimlerine paralel geçer (kaydırarak pimleri görün). Kırmızı = kesilen iç malzeme.'
     : 'Üst kalıp yarı saydam: pimler deliklere, kabartma oyuğa oturmalı. Bilet L-köşeye yaslı.';
   const lim = Math.round(Math.max(G.W, G.L) / 2);
   cutRange.min = -lim; cutRange.max = lim;
@@ -1247,16 +1525,18 @@ async function rebuild() {
   await new Promise(r => setTimeout(r, 0));
   if (id !== buildId) return;
   const warn = [];
+  const W_ = (k, t) => warn.push([k, t]);
   try {
     const G = layout();
     if (G.F < G.holeD + 2.5) throw new Error(`Pim flanşı en az ${(G.holeD + 2.5).toFixed(1)} mm olmalı.`);
     const TM = {}; let _t = performance.now(); const tick = k => { const n = performance.now(); TM[k] = Math.round(n - _t); _t = n; };
     const comp = composeDesign(curFont, G); tick('compose');
     lastComp = comp;
-    const design = comp.paths;
-    const lower = buildLower(design, G, curFont); tick('lower');
-    const upper = buildUpper(design, G, curFont); tick('upper');
-    const inserts = buildInserts(G, lower, upper); tick('inserts');
+    const design = comp.all;
+    const AX = computeAxis(comp, G); curAxis = AX;
+    const lower = buildLower(comp, G, curFont, AX); tick('lower');
+    const upper = buildUpper(comp, G, curFont, AX); tick('upper');
+    const inserts = buildInserts(G, lower, upper, AX); tick('inserts');
     setPartGeometry(male, lower);
     setPartGeometry(female, upper); tick('display');
 
@@ -1275,16 +1555,19 @@ async function rebuild() {
       insertParts.push({ def, row, mounted });
     }
 
-    // İnce bölge katmanları ve bilet
+    // İnce bölge katmanları, bilet, eksen işaretleri
     for (const m of [thinMesh, ribMesh, ticketMesh, ticketEdge]) if (m) { overlays.remove(m); m.geometry.dispose(); m.material.dispose(); }
+    if (axisMarks) { overlays.remove(axisMarks); axisMarks.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); }); }
     thinMesh = ribMesh = ticketMesh = ticketEdge = null;
+    const H = effH(), cd = effCD();
     const thin = thinParts(design, P.minLine);
-    // Dişi kalıpta kalan duvar = tasarım boşluğu − 2 × (kağıt payı + yüz ofseti)
+    // Dişi tarafta kalan duvar = tasarım boşluğu − 2 × (kağıt payı + ağız ofseti)
     const work = [rect(G.ox + P.wallGap, G.oy + P.wallGap, G.W, G.L)];
-    const gaps = design.length ? difference(work, design) : [];
-    const expand = Math.max(0, P.paperOff + maleOff(P.paperOff));
-    const thinRibs = gaps.length ? thinParts(gaps, P.minRib + 2 * expand) : [];
-    thinMesh = shapeMesh(thin, lower.zTop + P.embossH + 0.03, 0xff2b2b, 0.95);
+    const gaps = design.length ? difference(work, comp.cores.length ? region(design.concat(comp.cores)) : design) : [];   // tarama araları kasıtlı, sayılmaz
+    const expand = Math.max(0, P.paperOff + H * tanD() / 2 - Math.min(P.paperOff, H) * tanD());
+    const thinRibs = gaps.length ? thinParts(gaps, P.minRib + 2 * expand, 0.25) : [];
+    const emb = P.relief === 'emboss';
+    thinMesh = shapeMesh(thin, lower.zTop + (emb ? H : 0) + 0.03, 0xff2b2b, 0.95);
     ribMesh = shapeMesh(thinRibs, lower.zTop + 0.03, 0xff9a1f, 0.95);
     if (thinMesh) overlays.add(thinMesh);
     if (ribMesh) overlays.add(ribMesh);
@@ -1293,39 +1576,59 @@ async function rebuild() {
     ticketMesh = new THREE.Mesh(tg, new THREE.MeshStandardMaterial({ color: 0xf6f1e4, transparent: true, opacity: 0.35, depthWrite: false, roughness: 0.9 }));
     ticketEdge = new THREE.LineSegments(new THREE.EdgesGeometry(tg), new THREE.LineBasicMaterial({ color: 0xf6f1e4, transparent: true, opacity: 0.55 }));
     overlays.add(ticketMesh, ticketEdge);
-
+    axisMarks = makeAxisMarks(AX, lower.zTop);
+    overlays.add(axisMarks);
     tick('overlays'); window.__timings = TM;
+
     // ---- Kontroller ----
     const thinA = areaMM2(thin), ribA = areaMM2(thinRibs);
-    if (fontErr && P.textMode !== 'none') warn.push(['err', 'Font yüklenemedi: ' + fontErr.message + '. İnternet bağlantısını kontrol edin.']);
-    if (!design.length) warn.push(['warn', 'Tasarım boş (logo veya yazı ekleyin).']);
+    const cavFace = emb ? upper.cavFace : lower.cavFace;
+    if (fontErr && P.textMode !== 'none') W_('err', 'Font yüklenemedi: ' + fontErr.message + '. İnternet bağlantısını kontrol edin.');
+    if (!design.length) W_('warn', 'Tasarım boş (logo veya yazı ekleyin).');
     const wallZone = offsetPaths([wallPoly(G)], U(0.3));
-    if (interArea(design, wallZone) > 0.0005) warn.push(['err', 'Desen L-dayama duvarına değiyor/çakışıyor. Tasarım X/Y konumunu artırın.']);
+    if (interArea(design, wallZone) > 0.0005) W_('err', 'Desen L-dayama duvarına değiyor/çakışıyor. Tasarım merkezini duvardan uzaklaştırın.');
     const safe = [rect(G.ox + P.wallGap + 0.8, G.oy + P.wallGap + 0.8, G.W - 1.2, G.L - 1.2)];
-    if (diffArea(upper.cavFace, safe) > 0.001) warn.push(['err', 'Dişi oyuk kalıp kenarına veya duvar kanalına çok yakın/taşıyor. Tasarımı küçültün veya içeri alın.']);
-    if (thinA > 0.3) warn.push(['warn', `İnce çizgi: toplam <b>${thinA.toFixed(2)} mm²</b> bölge ${P.minLine} mm'den ince (kırmızı). Bu kısımlar kağıtta zayıf çıkar: harf yüksekliğini veya çizgi kalınlığını artırın.`]);
-    if (ribA > 2.0) warn.push(['warn', `Dar boşluk: toplam <b>${ribA.toFixed(2)} mm²</b> bölgede tasarım boşluğu ${(P.minRib + 2 * expand).toFixed(2)} mm'den dar (turuncu). Dişi kalıpta bu boşluklar kapanır; harf içleri (R, D, 0…) kaybolabilir: harf aralığını/boyunu artırın.`]);
-    if (P.upperType === 'nut') {
-      const floor = P.upperT - upper.nd - upper.cd;
+    if (diffArea(cavFace, safe) > 0.001) W_('err', 'Oyuk kalıp kenarına veya duvar kanalına çok yakın/taşıyor. Tasarımı küçültün veya "Tasarımı ortala"ya basın.');
+    if (thinA > 0.3) W_('warn', `İnce çizgi: toplam <b>${thinA.toFixed(2)} mm²</b> bölge ${P.minLine} mm'den ince (kırmızı). Bu kısımlar kağıtta zayıf çıkar: harf yüksekliğini veya çizgi kalınlığını artırın.`);
+    if (ribA > 2.0) W_('warn', `Dar boşluk: toplam <b>${ribA.toFixed(2)} mm²</b> bölgede tasarım boşluğu ${(P.minRib + 2 * expand).toFixed(2)} mm'den dar (turuncu). Bu boşluklar kapanır; harf içleri kaybolabilir: harf aralığını/boyunu artırın.`);
+    if (comp.bigRaw > 0.5) W_('warn', `Büyük dolu alan: ${comp.bigRaw.toFixed(1)} mm² bölgeye Ø${P.bigD} mm daire sığıyor. Geniş dolu kabartma kartonu gerer ve buruşturur; "Kontur" veya "Kontur + tarama" seçin.`);
+    if (comp.filled > 0) W_('info', `${comp.filled.toFixed(1)} mm² büyük alan ${P.fillMode === 'hatch' ? 'kontur + taramaya' : 'kontura'} çevrildi.`);
+    // Pres ekseni
+    if (!AX.inside) W_('err', `Pres ekseni (${AX.x}, ${AX.y}) izin verilen bölgenin dışında: bağlantı kanal/kenar/pim deliklerine çok yakın. İzinli: X ${AX.box.x0.toFixed(1)}–${AX.box.x1.toFixed(1)}, Y ${AX.box.y0.toFixed(1)}–${AX.box.y1.toFixed(1)} mm.`);
+    if (design.length && AX.offset > 3) W_('warn', `Yük merkezi pres ekseninden <b>${AX.offset.toFixed(1)} mm</b> kaçık: kalıp bastırırken yatabilir, kabartma bir tarafta sığ çıkar.${P.axisMode !== 'auto' ? ' "Otomatik" eksen modunu deneyin.' : ' Eksen izinli bölgenin sınırında; tasarımı merkeze yaklaştırın.'}`);
+    else if (design.length && AX.offset > 1) W_('info', `Yük merkezi eksenden ${AX.offset.toFixed(1)} mm kaçık (kabul edilebilir).`);
+    // Et kalınlıkları
+    if (emb && P.upperType === 'nut') {
+      const floor = P.upperT - upper.nd - cd;
       if (interArea(upper.cavFace, upper.hex) > 0.001 && floor < 1.0)
-        warn.push(['warn', `Oyuk ile somun yuvası arasında yalnızca <b>${floor.toFixed(2)} mm</b> et kalıyor. Üst plakayı <b>${(upper.nd + upper.cd + 1).toFixed(1)} mm</b> yapın.`]);
+        W_('warn', `Oyuk ile somun yuvası arasında yalnızca <b>${floor.toFixed(2)} mm</b> et kalıyor. Üst plakayı <b>${(upper.nd + cd + 1).toFixed(1)} mm</b> yapın.`);
     }
-    if (upper.clamped) warn.push(['warn', `Dişli delik derinliği ${upper.thd.toFixed(1)} mm ile sınırlandı (oyuğa ≥0.6 mm et). Üst plakayı kalınlaştırın.`]);
-    if (P.lowerType === 'hole' && lower.lhd < P.lowerHoleDepth) warn.push(['warn', `Alt delik derinliği ${lower.lhd.toFixed(1)} mm ile sınırlandı.`]);
-    if (P.lowerType === 'pin') warn.push(['info', 'Entegre pres pimi seçili: plaka pimin üstünde havada kalır, <b>destek gerekir</b>. Desteksiz baskı için "Dişi delik + ayrı pim" seçin.']);
-    if (P.cavityD < P.embossH + P.paperOff * 0.5) warn.push(['warn', 'Dişi oyuk sığ: oyuk derinliği ≈ kabartma + kağıt kalınlığı olmalı.']);
-    if (P.guideH < P.wallH + 1) warn.push(['warn', 'Kılavuz pimi kısa; kabartma kağıda değmeden önce deliğe girmeli.']);
-    if (lower.badEdges || upper.badEdges || inserts.some(i => i.res.badEdges))
-      warn.push(['warn', `Ağ kontrolü: ${lower.badEdges + upper.badEdges} kenarda şekiller birbirine tam teğet değiyor (genellikle harf/çerçeve teması). Dilimleyiciler bunu otomatik onarır; tamamen temiz dosya için harf aralığını veya yarıçapı 0.1 mm değiştirin.`]);
-    if (!warn.some(w => w[0] !== 'info')) warn.unshift(['ok', 'Tüm kontroller başarılı. Kalıplar baskıya hazır.']);
+    if (!emb && P.lowerType === 'hole') {
+      const floor = P.lowerT - lower.lhd - cd;
+      if (interArea(lower.cavFace, [circle(AX.x, AX.y, P.lowerHoleD / 2, 64)]) > 0.001 && floor < 1.0)
+        W_('warn', `Alt oyuk ile pres deliği arasında yalnızca <b>${floor.toFixed(2)} mm</b> et kalıyor. Alt plakayı kalınlaştırın veya delik derinliğini azaltın.`);
+    }
+    for (const t of [...lower.warns, ...upper.warns]) W_('warn', t);
+    if (!emb && P.upperType === 'stud') W_('warn', 'Ters kabartma + entegre cıvata: üst kalıp desen yukarı basılır, cıvata alta gelir ve <b>destek gerekir</b>. Desteksiz baskı için "Somun yuvası" veya "Dişli delik" seçin.');
+    if (P.lowerType === 'pin') W_('info', 'Entegre pres pimi seçili: plaka pimin üstünde havada kalır, <b>destek gerekir</b>. Desteksiz baskı için "Dişi delik + ayrı pim" seçin.');
+    if (cd < H + P.paperOff * 0.5) W_('warn', 'Oyuk sığ: oyuk derinliği ≈ kabartma + kağıt kalınlığı olmalı.');
+    if (P.guideH < P.wallH + 1) W_('warn', 'Kılavuz pimi kısa; kabartma kağıda değmeden önce deliğe girmeli.');
+    if (Math.abs(H - P.embossH) > 0.005 || Math.abs(cd - P.cavityD) > 0.005) W_('info', `Katman yüksekliğine (${LH()} mm) yuvarlandı: kabartma <b>${H.toFixed(2)}</b>, oyuk <b>${cd.toFixed(2)} mm</b>.`);
+    const badT = lower.badEdges + upper.badEdges;
+    if (badT || inserts.some(i => i.res.badEdges))
+      W_('warn', `Ağ kontrolü: ${badT} kenarda şekiller birbirine tam teğet değiyor (genellikle harf/çerçeve teması). Dilimleyiciler bunu otomatik onarır; tamamen temiz dosya için harf aralığını veya yarıçapı 0.1 mm değiştirin.`);
+    if (!warn.some(w => w[0] === 'warn' || w[0] === 'err')) warn.unshift(['ok', 'Tüm kontroller başarılı. Kalıplar baskıya hazır.']);
 
+    const lv = lower.levels.length > 1 ? ` · Seviyeler: ${lower.levels.map(l => Math.round(l.frac * 100) + '% (' + l.Ht.toFixed(2) + ')').join(', ')}` : '';
     document.getElementById('info').innerHTML = `
       Tasarım: <b>${comp.w.toFixed(1)} × ${comp.h.toFixed(1)} mm</b> · Çalışma alanı: <b>${(G.W - G.ox).toFixed(1)} × ${(G.L - G.oy).toFixed(1)} mm</b><br>
+      ${emb ? 'Kabartma' : 'Ters kabartma'}: <b>${H.toFixed(2)} mm</b>, oyuk <b>${cd.toFixed(2)} mm</b>${lv}<br>
+      Pres ekseni: <b>X ${AX.x.toFixed(1)}, Y ${AX.y.toFixed(1)}</b> · yük kaçıklığı <b>${AX.offset.toFixed(1)} mm</b><br>
       Alt kalıp: <b>${G.W} × ${G.L} × ${lower.height.toFixed(1)} mm</b> · Üst kalıp: <b>${G.W} × ${G.L} × ${upper.height.toFixed(1)} mm</b><br>
-      Üst pim deliği Ø<b>${G.holeD.toFixed(2)}</b> × <b>${upper.hd.toFixed(1)}</b> · Duvar kanalı <b>${(P.wallT + 2 * P.wallGap).toFixed(1)} × ${upper.gd.toFixed(2)} mm</b>`;
+      Üst pim deliği Ø<b>${G.holeD.toFixed(2)}</b> × <b>${P.upperHoleMode === 'through' ? 'boydan boya' : upper.hd.toFixed(1)}</b> · Duvar kanalı <b>${(P.wallT + 2 * P.wallGap).toFixed(1)} × ${upper.gd.toFixed(2)} mm</b>`;
     const st = (r, name, col) => `<div class="part"><span class="dot" style="background:${col}"></span>${name}:
-      <span class="${r.badEdges ? 'bad' : 'good'}">${r.badEdges ? '⚠ ' + r.badEdges + ' hatalı kenar' : '✓ su geçirmez'}</span> · ${r.triCount.toLocaleString('tr-TR')} üçgen</div>`;
-    document.getElementById('status').innerHTML = st(lower, 'Alt Kalıp (Erkek)', '#5b8def') + st(upper, 'Üst Kalıp (Dişi)', '#f0a43a') +
+      <span class="${r.badEdges ? 'bad' : 'good'}">${r.badEdges ? '⚠ ' + r.badEdges + ' teğet kenar' : '✓ su geçirmez'}</span> · ${r.triCount.toLocaleString('tr-TR')} üçgen</div>`;
+    document.getElementById('status').innerHTML = st(lower, `Alt Kalıp (${emb ? 'Erkek' : 'Dişi'})`, '#5b8def') + st(upper, `Üst Kalıp (${emb ? 'Dişi' : 'Erkek'})`, '#f0a43a') +
       (inserts.length ? `<div class="part"><span class="dot" style="background:#a5adb8"></span>Ek parçalar: ${[...new Set(inserts.map(i => i.label))].join(', ')} <span class="${inserts.some(i => i.res.badEdges) ? 'bad' : 'good'}">${inserts.some(i => i.res.badEdges) ? '⚠' : '✓'}</span></div>` : '');
     document.getElementById('insertBtns').innerHTML = inserts.map((d, i) => `<button class="primary dl-ins" data-ins="${i}">${esc(d.label)} .STL</button>`).join('');
     document.querySelectorAll('[data-ins]').forEach(b => b.addEventListener('click', () => { const d = inserts[+b.dataset.ins]; downloadFile(stlBytes(d.res.pos, d.res.idx), d.file); }));
@@ -1335,7 +1638,7 @@ async function rebuild() {
     firstBuild = false;
   } catch (e) {
     console.error(e);
-    warn.push(['err', 'Hata: ' + (e && e.message ? e.message : e)]);
+    W_('err', 'Hata: ' + (e && e.message ? e.message : e));
   }
   busy.style.display = 'none';
   document.getElementById('warnings').innerHTML = warn.map(([k, t]) => `<div class="msg ${k}">${t}</div>`).join('');
@@ -1343,29 +1646,36 @@ async function rebuild() {
 let currentInserts = [];
 
 function renderPrintCard(lower, upper, inserts) {
-  const faceDown = upper.faceDown;
+  const emb = P.relief === 'emboss', faceDown = upper.faceDown, lh = LH();
+  const H = effH(), cd = effCD();
   const tags = a => a.map(x => `<span class="tag">${x}</span>`).join('');
-  let h = `<h4>Genel ayarlar</h4>${tags(['PLA+ / PETG', 'Nozul 0.4', 'Katman 0.12 mm', 'İlk katman 0.2 mm', '4–5 duvar', 'Üst/Alt 6 katman', 'Dolgu %80–100 gyroid'])}
-    <ul><li><b>PLA+</b> daha sert, daha keskin kabartma verir; <b>PETG</b> darbeye/çatlamaya daha dayanıklıdır.</li>
-    <li>Pres yükü için yüksek dolgu önemlidir; ince katman kabartma ve diş detayını korur.</li>
-    <li>Önce <b>tolerans test parçasını</b> basın: 1–5 delikleri = pim Ø +0.1…+0.5 mm, A–C yuvaları = anahtar ağzı +0.1/+0.2/+0.3 mm. En iyi oturanı "Pim-Delik Toleransı" ve "Somun Yuvası Payı"na yazın.</li></ul>
-    <h4>Alt kalıp (erkek)</h4><ul>
-    <li>Yön: taban tablada, kabartma yukarı. ${P.lowerType === 'pin' ? '<b>Destek gerekli</b> (pim üstündeki plaka havada).' : 'Destek <b>gerekmez</b> (Ø' + P.lowerHoleD + ' delik tavanı köprüyle oluşur).'}</li>
-    <li><b>Ütüleme (ironing)</b> açın: kabartma tepeleri pürüzsüz olur.</li>
-    <li>Kenar eğimi ${P.draft}°; kabartma ${P.embossH} mm.</li></ul>
-    <h4>Üst kalıp (dişi)</h4><ul>
+  const f2 = v => (Math.max(0, v)).toFixed(2);
+  // İnce katman aralıkları (baskı yönündeki Z)
+  const lowRange = emb ? [lower.zTop - 0.2, lower.zTop + Math.max(H, P.guideType === 'printed' ? P.guideH : 0)] : [lower.zTop - cd - 0.2, lower.zTop + P.guideH];
+  const map = upperPrintMap(upper);
+  const zs = emb ? [0, cd + 0.2] : [-H, 0.2];
+  const up = zs.map(z => map(0, 0, z)[2]).sort((a, b) => a - b);
+  let h = `<h4>Genel ayarlar</h4>${tags(['PLA+ / PETG', 'Nozul 0.4 (detay için 0.2)', `İnce katman ${lh} mm`, 'Gövde 0.2 mm', '4–5 duvar', 'Üst/Alt 6 katman', 'Dolgu %80–100 gyroid', 'Arachne duvar'])}
+    <ul><li><b>Yükseklik aralığına göre katman</b> (Bambu Studio / OrcaSlicer: nesneye sağ tık → <i>Yükseklik aralığı ekle</i>; Cura: <i>Adaptive layers</i>):<br>
+      Alt kalıp <b>${f2(lowRange[0])}–${f2(lowRange[1])} mm</b> arası ${lh} mm · Üst kalıp <b>${f2(up[0])}–${f2(up[1])} mm</b> arası ${lh} mm${P.upperType === 'stud' ? ` · cıvata bölgesi (${f2(map(0, 0, P.upperT)[2])}–${f2(map(0, 0, P.upperT + P.studLen)[2])} mm) ${lh}–0.12 mm` : ''}. Geri kalanı 0.2 mm.</li>
+    <li>Kabartma ${H.toFixed(2)} mm ve oyuk ${cd.toFixed(2)} mm, ${lh} mm katmanın tam katıdır; eğim kademeleri katmanlarla birebir örtüşür.</li>
+    <li><b>Dikiş</b> arkaya hizalı (veya scarf seam), <b>önce dış duvar</b>, dış duvar 40–60 mm/s, fan %100, min. katman süresi 6–8 sn. Filamenti kurutun.</li>
+    <li>Önce <b>tolerans test parçasını</b> basın: 1–5 delikleri = pim Ø +0.1…+0.5 mm, A–C yuvaları = anahtar ağzı +0.1/+0.2/+0.3 mm.</li></ul>
+    <h4>Alt kalıp (${emb ? 'erkek' : 'dişi'})</h4><ul>
+    <li>Yön: taban tablada, ${emb ? 'kabartma' : 'oyuk'} yukarı. ${P.lowerType === 'pin' ? '<b>Destek gerekli</b> (pim üstündeki plaka havada).' : 'Destek <b>gerekmez</b> (Ø' + P.lowerHoleD + ' delik tavanı köprüyle oluşur).'}</li>
+    ${emb ? '<li><b>Ütüleme (ironing)</b> açın: kabartma tepeleri pürüzsüz olur.</li>' : '<li>Oyuk kenarları keskin kalsın diye üst yüzde ütüleme kapalı kalabilir.</li>'}</ul>
+    <h4>Üst kalıp (${emb ? 'dişi' : 'erkek'})</h4><ul>
     ${faceDown
-      ? `<li>Yön: <b>oyuklu yüz tablada</b>, ${P.threadSize} cıvata yukarı — desteksiz. Yüz cam gibi düz çıkar.</li>
-         <li>Oyuk tabanları köprüyle oluşur: köprü hızı düşük, fan %100. "Elephant foot" telafisini 0.1–0.15 mm açın ki oyuk kenarları keskin kalsın.</li>
-         <li>Cıvata dişleri için katman 0.12 mm ve dış duvar hızı yavaş olsun.</li>`
-      : `<li>Yön: <b>oyuk yukarı</b>, arka yüz tablada — desteksiz. ${P.upperType === 'nut' ? 'Somun yuvası tablaya açılır.' : 'Dişli delik tablaya açılır.'}</li>
-         <li>Oyuk kenarları keskin çıksın diye üst yüzde ütüleme kapalı kalabilir.</li>`}
+      ? `<li>Yön: <b>oyuklu yüz tablada</b>, ${P.threadSize} cıvata yukarı — desteksiz. <b>Düz (dokusuz) tabla</b> kullanın: dokulu PEI dokusunu yüze ve kağıda geçirir.</li>
+         <li>Oyuk tabanları köprüyle oluşur: köprü hızı düşük, fan %100. "Elephant foot" telafisi 0.1–0.15 mm.</li>`
+      : `<li>Yön: <b>${emb ? 'oyuk' : 'desen'} yukarı</b>, arka yüz tablada${!emb && P.upperType === 'stud' ? ' — cıvata alta gelir, <b>destek gerekir</b>' : ' — desteksiz'}.</li>
+         ${emb ? '' : '<li><b>Ütüleme</b> açın: desen tepeleri pürüzsüz olur.</li>'}`}
     </ul>`;
   if (inserts.length) {
-    h += `<h4>Ek parçalar</h4><ul>${inserts.map(i => `<li><b>${esc(i.label)}</b>: dik basın${/pim/i.test(i.label) ? ', 3 mm brim' : ''}${/Saplama/.test(i.label) ? ', %100 dolgu, 0.12 mm katman' : ''}${/Somun/.test(i.label) ? ', düz yatırarak, %100 dolgu' : ''}.</li>`).join('')}
-      <li>Çelik pim (Ø${P.guideD} DIN 6325) basılı pim yerine kullanılabilir.</li></ul>`;
+    h += `<h4>Ek parçalar</h4><ul>${inserts.map(i => `<li><b>${esc(i.label)}</b>: dik basın${/pim/i.test(i.label) ? ', 3 mm brim' : ''}${/Saplama/.test(i.label) ? `, %100 dolgu, ${lh}–0.12 mm katman` : ''}${/Somun/.test(i.label) ? ', düz yatırarak, %100 dolgu' : ''}.</li>`).join('')}
+      ${P.guideType === 'steel' ? `<li>Çelik pim (Ø${P.guideD} DIN 6325) basılı pim yerine kullanılabilir${P.lowerHoleMode === 'through' ? '; boydan boya delikten alttan itilerek çıkarılır' : ''}.</li>` : ''}</ul>`;
   }
-  if (P.backOn) h += `<div class="hint">Kalıp arkalarına ${P.backDepth} mm derinlikte "ALT"/"ÜST" kazınır; tablaya bakan yüzde olsa bile baskıyı zorlamaz.</div>`;
+  if (P.backOn) h += `<div class="hint">Kalıp arkalarına ${snap(P.backDepth).toFixed(2)} mm derinlikte "ALT"/"ÜST" kazınır; tablaya bakan yüzde olsa bile baskıyı zorlamaz.</div>`;
   document.getElementById('printCard').innerHTML = h;
 }
 
@@ -1382,11 +1692,10 @@ function stlBytes(pos, idx) {
   return new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
 }
 function upperPrintPos() {
-  const d = female.data;
-  if (d.faceDown) return d.pos;
-  const out = new Float32Array(d.pos.length), L = P.baseL, T = P.upperT;
-  for (let i = 0; i < d.pos.length; i += 3) { out[i] = d.pos[i]; out[i + 1] = L - d.pos[i + 1]; out[i + 2] = T - d.pos[i + 2]; }
-  return out;   // X ekseni etrafında 180° döndürme (ayna değil)
+  const d = female.data, f = upperPrintMap(d);
+  const out = new Float32Array(d.pos.length);
+  for (let i = 0; i < d.pos.length; i += 3) { const v = f(d.pos[i], d.pos[i + 1], d.pos[i + 2]); out[i] = v[0]; out[i + 1] = v[1]; out[i + 2] = v[2]; }
+  return out;   // öteleme veya X ekseni etrafında 180° döndürme (ayna değil)
 }
 function downloadFile(bytes, name, type = 'model/stl') {
   const a = document.createElement('a');
@@ -1395,10 +1704,12 @@ function downloadFile(bytes, name, type = 'model/stl') {
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 3000);
 }
+const lowerName = () => P.relief === 'emboss' ? 'alt_kalip_erkek.stl' : 'alt_kalip_disi.stl';
+const upperName = () => P.relief === 'emboss' ? 'ust_kalip_disi.stl' : 'ust_kalip_erkek.stl';
 function partFiles() {
   const files = {
-    'alt_kalip_erkek.stl': stlBytes(male.data.pos, male.data.idx),
-    'ust_kalip_disi.stl': stlBytes(upperPrintPos(), female.data.idx),
+    [lowerName()]: stlBytes(male.data.pos, male.data.idx),
+    [upperName()]: stlBytes(upperPrintPos(), female.data.idx),
   };
   const seen = new Set();
   for (const d of currentInserts) { if (seen.has(d.file)) continue; seen.add(d.file); files[d.file] = stlBytes(d.res.pos, d.res.idx); }
@@ -1406,8 +1717,8 @@ function partFiles() {
 }
 document.querySelectorAll('[data-dl]').forEach(b => b.addEventListener('click', () => {
   if (!male.data) return;
-  if (b.dataset.dl === 'male') downloadFile(stlBytes(male.data.pos, male.data.idx), 'alt_kalip_erkek.stl');
-  else downloadFile(stlBytes(upperPrintPos(), female.data.idx), 'ust_kalip_disi.stl');
+  if (b.dataset.dl === 'male') downloadFile(stlBytes(male.data.pos, male.data.idx), lowerName());
+  else downloadFile(stlBytes(upperPrintPos(), female.data.idx), upperName());
 }));
 function downloadZip() {
   if (!male.data) return;
@@ -1449,8 +1760,9 @@ document.getElementById('svgFile').addEventListener('change', e => {
 document.getElementById('sampleBtn').addEventListener('click', () => { document.getElementById('svgFile').value = ''; loadSVGText(SAMPLE_SVG, 'örnek logo', false); });
 document.getElementById('centerBtn').addEventListener('click', () => {
   const G = layout();
-  P.designX = +(((G.W - G.ox) - lastComp.w) / 2).toFixed(2);
-  P.designY = +(((G.L - G.oy) - lastComp.h) / 2).toFixed(2);
+  const bx = lastComp.bx || [0, 0, 0, 0];
+  P.designX = +((G.W - G.ox) / 2 - (bx[0] + bx[2]) / 2).toFixed(2);
+  P.designY = +((G.L - G.oy) / 2 - (bx[1] + bx[3]) / 2).toFixed(2);
   syncPanel(); onParamsChanged();
 });
 document.getElementById('resetBtn').addEventListener('click', () => {
@@ -1483,11 +1795,11 @@ document.querySelectorAll('#modes button').forEach(b => b.addEventListener('clic
   mode = +b.dataset.mode; applyMode();
 }));
 for (const el of [openRange, cutRange]) el.addEventListener('input', () => applyMode());
-for (const el of [wireChk, thinChk, ticketChk]) el.addEventListener('change', () => applyMode());
+for (const el of [wireChk, thinChk, ticketChk, axisChk]) el.addEventListener('change', () => applyMode());
 document.getElementById('resetView').addEventListener('click', () => fitCamera());
 
 window.stampApp = { P, DEFAULTS, male, female, get inserts() { return currentInserts; }, rebuild, buildCoupon: () => buildCoupon(curFont),
-  camera, controls, setMode: m => document.querySelector(`#modes button[data-mode="${m}"]`).click(), partFiles };
+  camera, controls, setStrict: v => { STRICT_CAPS = v; }, setMode: m => document.querySelector(`#modes button[data-mode="${m}"]`).click(), partFiles };
 
 if (customSVG) loadSVGText(customSVG, customSVGName, true);
 else loadSVGText(SAMPLE_SVG, 'örnek logo', false);
