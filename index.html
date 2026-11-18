@@ -88,6 +88,7 @@
   }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/clipper-lib@6.4.2/clipper.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/earcut@2.2.4/dist/earcut.min.js"></script>
 <script type="importmap">
 {
   "imports": {
@@ -156,22 +157,21 @@
   <div id="busy" class="overlay card">Hesaplanıyor…</div>
 </main>
 
-<script type="module">
-import * as THREE from 'three';
-import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
-import { SVGLoader } from 'three/addons/loaders/SVGLoader.js';
-import { STLExporter } from 'three/addons/exporters/STLExporter.js';
-import * as BufferGeometryUtils from 'three/addons/utils/BufferGeometryUtils.js';
-import { zipSync } from 'three/addons/libs/fflate.module.js';
-import opentype from 'opentype';
 
+<!-- Geometri çekirdeği: sayfada ve arka plan işçisinde (Web Worker) aynı kod çalışır -->
+<script id="geomlib">
+var GEOM = (function () {
+'use strict';
+let P = {};                      // aktif parametreler (buildAll ayarlar)
+const Q = { preview: false };    // hızlı önizleme kalitesi
+const deg2rad = d => d * Math.PI / 180;
 /* =====================================================================
    0) SABİTLER / YARDIMCILAR
    Tüm 2D geometri Clipper tamsayı uzayında: 1 birim = 1 µm. Katmanlar
    arasındaki ortak kenarlar birebir aynı köşelere sahip olur ve tek
    parça, su geçirmez (manifold) bir ağ örülebilir.
    ===================================================================== */
-const CL = window.ClipperLib;
+const CL = self.ClipperLib;
 const S = 1000;
 const U = mm => Math.round(mm * S);
 const NZ = CL.PolyFillType.pftNonZero;
@@ -304,30 +304,32 @@ function buildSolid(layers) {
       }
     }
   }
-  // Yüzey üçgenleme; alan tutmazsa (kısıtsız Clipper çıktısı) false döner
+  // Yüzey üçgenleme; check açıkken alanı tutmayan şekiller (kısıtsız Clipper çıktısı) ayrı döndürülür
   const addCap = (shapes, z, up, check = false) => {
-    const pending = [];
+    const pending = [], bad = [];
     for (const sh of shapes) {
       if (sh.outer.length < 3) continue;
-      const contour = sh.outer.map(p => new THREE.Vector2(p.X, p.Y));
-      const holes = sh.holes.filter(h => h.length >= 3).map(h => h.map(p => new THREE.Vector2(p.X, p.Y)));
-      const faces = THREE.ShapeUtils.triangulateShape(contour, holes);
-      const all = contour.concat(...holes);
-      const ids = all.map(p => V(p.x, p.y, z));
+      const rings = [sh.outer, ...sh.holes.filter(h => h.length >= 3)];
+      const flat = [], holeIdx = [], all = [];
+      rings.forEach((r, ri) => { if (ri) holeIdx.push(all.length); for (const p of r) { flat.push(p.X, p.Y); all.push(p); } });
+      const tri = self.earcut(flat, holeIdx.length ? holeIdx : null, 2);
+      const faces = [];
+      for (let i = 0; i < tri.length; i += 3) faces.push([tri[i], tri[i + 1], tri[i + 2]]);
+      const ids = all.map(p => V(p.X, p.Y, z));
       let sum = 0;
-      for (const f of faces) { const A = all[f[0]], B = all[f[1]], C = all[f[2]]; sum += (B.x - A.x) * (C.y - A.y) - (B.y - A.y) * (C.x - A.x); }
+      for (const f of faces) { const A = all[f[0]], B = all[f[1]], C = all[f[2]]; sum += (B.X - A.X) * (C.Y - A.Y) - (B.Y - A.Y) * (C.X - A.X); }
       if (check) {
         const exp = Math.abs(signedArea(sh.outer)) - sh.holes.reduce((a, h) => a + Math.abs(signedArea(h)), 0);
-        if (Math.abs(Math.abs(sum) / 2 - exp) > Math.max(50, exp * 1e-4)) return false;
+        if (Math.abs(Math.abs(sum) / 2 - exp) > Math.max(50, exp * 1e-4)) { bad.push(sh); continue; }
       }
       const flip = up ? sum < 0 : sum > 0;
       pending.push([faces, ids, flip]);
     }
     for (const [faces, ids, flip] of pending)
       for (const f of faces) flip ? T(ids[f[0]], ids[f[2]], ids[f[1]]) : T(ids[f[0]], ids[f[1]], ids[f[2]]);
-    return true;
+    return bad;
   };
-  const capOf = paths => treeShapes(clipOp(CL.ClipType.ctUnion, paths, null, NZ, true));
+  const capOf = paths => groupShapes(paths);
   if (layers.length) {
     addCap(capOf(layers[0].bot), layers[0].z0, false);
     for (let i = 0; i + 1 < layers.length; i++) {
@@ -339,18 +341,18 @@ function buildSolid(layers) {
       }
       if (samePaths(A, B)) continue;
       const z = layers[i].z1;
-      for (const [X, Y, up] of [[A, B, true], [B, A, false]]) {
-        if (!addCap(treeShapes(clipOp(CL.ClipType.ctDifference, X, Y, NZ, true, STRICT_CAPS)), z, up, !STRICT_CAPS))
-          addCap(treeShapes(clipOp(CL.ClipType.ctDifference, X, Y, NZ, true, true)), z, up);
+      // Yalnızca değişen bölgeleri hesapla: ortak çevreleyen konturu çıkar, kalanları bağımsız kümelere böl
+      for (const [Xs, Ys, up] of interfaceTasks(A, B)) {
+        const bad = addCap(treeShapes(clipOp(CL.ClipType.ctDifference, Xs, Ys, NZ, true, STRICT_CAPS)), z, up, !STRICT_CAPS);
+        // yalnız bozuk çıkan tek şekli katı (strictly simple) moda gönder
+        for (const sh of bad) addCap(treeShapes(clipOp(CL.ClipType.ctUnion, [sh.outer, ...sh.holes], null, NZ, true, true)), z, up);
       }
     }
     const last = layers[layers.length - 1];
     addCap(capOf(last.top), last.z1, true);
   }
   tris = repairTJunctions(pos, tris);
-  if (window.__dbg) window.__badList = [];
-  const bad = countBadEdges(tris);
-  if (window.__dbg && bad) (window.__bads = window.__bads || []).push(window.__badList.map(([a, b, c, r]) => [pos.slice(a * 3, a * 3 + 3).join(','), pos.slice(b * 3, b * 3 + 3).join(','), c, r]));
+  const bad = Q.preview ? 0 : countBadEdges(tris);
   const P = new Float32Array(pos.length);
   let zMin = Infinity, zMax = -Infinity;
   for (let i = 0; i < pos.length; i++) P[i] = pos[i] / S;
@@ -358,6 +360,92 @@ function buildSolid(layers) {
   const I = new Uint32Array(tris.length * 3);
   for (let i = 0; i < tris.length; i++) { I[i * 3] = tris[i][0]; I[i * 3 + 1] = tris[i][1]; I[i * 3 + 2] = tris[i][2]; }
   return { pos: P, idx: I, triCount: tris.length, badEdges: bad, zMin, zMax };
+}
+
+/* ---------- Hızlı yüzey hesabı yardımcıları ---------- */
+function bboxOf(p) {
+  let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity;
+  for (const v of p) { if (v.X < x0) x0 = v.X; if (v.X > x1) x1 = v.X; if (v.Y < y0) y0 = v.Y; if (v.Y > y1) y1 = v.Y; }
+  return { x0, y0, x1, y1 };
+}
+const contourKey = p => {
+  let m = 0;
+  for (let i = 1; i < p.length; i++) if (p[i].X < p[m].X || (p[i].X === p[m].X && p[i].Y < p[m].Y)) m = i;
+  let s = '';
+  for (let i = 0; i < p.length; i++) { const v = p[(m + i) % p.length]; s += v.X + ',' + v.Y + ';'; }
+  return s;
+};
+// Kutuları çakışan konturları kümeler (süpürme + birleşim-bul)
+function clusterByBox(boxes) {
+  const n = boxes.length, par = Array.from({ length: n }, (_, i) => i);
+  const find = i => { while (par[i] !== i) { par[i] = par[par[i]]; i = par[i]; } return i; };
+  const order = [...par].sort((a, b) => boxes[a].x0 - boxes[b].x0);
+  const active = [];
+  for (const i of order) {
+    const b = boxes[i];
+    for (let j = active.length - 1; j >= 0; j--) {
+      const a = boxes[active[j]];
+      if (a.x1 < b.x0) { active.splice(j, 1); continue; }
+      if (a.y0 <= b.y1 && b.y0 <= a.y1) { const ra = find(active[j]), rb = find(i); if (ra !== rb) par[ra] = rb; }
+    }
+    active.push(i);
+  }
+  const groups = new Map();
+  for (let i = 0; i < n; i++) { const r = find(i); if (!groups.has(r)) groups.set(r, []); groups.get(r).push(i); }
+  return [...groups.values()];
+}
+// Yönlü konturları (dış CCW, delik CW) Clipper'sız şekillere grupla
+function groupShapes(paths) {
+  const outers = [], holes = [];
+  for (const p of paths) { if (p.length < 3) continue; const a = signedArea(p); (a > 0 ? outers : holes).push({ p, a: Math.abs(a), b: bboxOf(p) }); }
+  const shapes = outers.map(o => ({ outer: o.p, holes: [], o }));
+  for (const h of holes) {
+    let best = null;
+    for (const s of shapes) {
+      const b = s.o.b;
+      if (b.x0 > h.b.x0 || b.y0 > h.b.y0 || b.x1 < h.b.x1 || b.y1 < h.b.y1) continue;
+      if (best && s.o.a >= best.o.a) continue;
+      let inside = 0;
+      for (let k = 0; k < Math.min(h.p.length, 4) && !inside; k++) inside = CL.Clipper.PointInPolygon(h.p[k], s.outer) === 1 ? 1 : 0;
+      if (inside) best = s;
+    }
+    if (best) best.holes.push(h.p);
+  }
+  return shapes;
+}
+// Katman arası A\B (yukarı) ve B\A (aşağı) için küçük, bağımsız Clipper işleri üret
+function interfaceTasks(A, B) {
+  let a = A.slice(), b = B.slice(), C = null;
+  // 1) iki tarafta birebir aynı olan ve her şeyi çevreleyen dış kontur (ör. kalıp plakası) varsa
+  //    onu ayır; her kümenin hesabına yeniden eklenir → küçük, doğru sonuçlu Clipper işleri
+  const keysB = new Map(b.map((p, i) => [contourKey(p), i]));
+  for (let i = 0; i < a.length; i++) {
+    if (signedArea(a[i]) <= 0) continue;
+    const j = keysB.get(contourKey(a[i]));
+    if (j === undefined) continue;
+    const cb = bboxOf(a[i]);
+    const encl = p => { const q = bboxOf(p); return q.x0 >= cb.x0 && q.y0 >= cb.y0 && q.x1 <= cb.x1 && q.y1 <= cb.y1; };
+    if (a.every((p, k) => k === i || encl(p)) && b.every((p, k) => k === j || encl(p))) {
+      C = a[i]; a.splice(i, 1); b.splice(j, 1);
+      break;
+    }
+  }
+  // 2) bağımsız kümeler (kutuları çakışmayan konturlar birbirini etkilemez)
+  const all = a.map(p => ({ p, s: 0 })).concat(b.map(p => ({ p, s: 1 })));
+  const boxes = all.map(e => bboxOf(e.p));
+  const tasks = [];
+  for (const g of clusterByBox(boxes)) {
+    const S1 = [], S2 = [];
+    for (const i of g) (all[i].s ? S2 : S1).push(all[i].p);
+    if (S1.length === S2.length && samePaths(S1, S2)) continue;
+    if (S1.length && S2.length) {
+      const k1 = S1.map(contourKey).sort().join('|'), k2 = S2.map(contourKey).sort().join('|');
+      if (k1 === k2) continue;
+    }
+    if (C) { S1.unshift(C); S2.unshift(C); }
+    tasks.push([S1, S2, true], [S2, S1, false]);
+  }
+  return tasks;
 }
 
 const EK = 4194304;
@@ -421,7 +509,7 @@ function countBadEdges(tris) {
   const dir = new Map();
   for (const t of tris) for (let s = 0; s < 3; s++) { const k = t[s] * EK + t[(s + 1) % 3]; dir.set(k, (dir.get(k) || 0) + 1); }
   let bad = 0;
-  for (const [k, c] of dir) { const a = Math.floor(k / EK), b = k - a * EK; if (c !== 1 || dir.get(b * EK + a) !== 1) { bad++; if (window.__badList && window.__badList.length < 40) window.__badList.push([a, b, c, dir.get(b * EK + a) || 0]); } }
+  for (const [k, c] of dir) { const a = Math.floor(k / EK), b = k - a * EK; if (c !== 1 || dir.get(b * EK + a) !== 1) bad++; }
   return bad;
 }
 
@@ -510,7 +598,7 @@ function thread(cx, cy, kind, spec, clear, zb, zt, opt = {}) {
   let rMaj, rMin;
   if (kind === 'ext') { rMaj = (d - clear) / 2; rMin = rMaj - 0.6134 * p; }
   else { rMaj = (d + clear) / 2; rMin = (d - 1.0825 * p + clear) / 2; }
-  const N = Math.max(48, Math.round(d * 8));
+  const N = Q.preview ? 32 : Math.max(48, Math.round(d * 8));
   const c = opt.cham ?? 0.6;
   const at = zU => {
     const z = zU / S, out = [];
@@ -532,7 +620,7 @@ function thread(cx, cy, kind, spec, clear, zb, zt, opt = {}) {
     }
     return kind === 'int' ? out.reverse() : out;
   };
-  return { z0: U(zb), z1: U(zt), at, steps: len => Math.max(1, Math.ceil(len / U(p / 12))) };
+  return { z0: U(zb), z1: U(zt), at, steps: len => Math.max(1, Math.ceil(len / U(p / (Q.preview ? 4 : 12)))) };
 }
 // Pahlı silindir pim (ayrı basılan parça)
 function pinPart(r, len, chamTop, chamBot, n = 64) {
@@ -543,6 +631,625 @@ function pinPart(r, len, chamTop, chamBot, n = 64) {
   if (chamTop > 0) profiles.push(frustum(0, 0, r, r - chamTop, z1, len, n));
   return stack({ solids, profiles });
 }
+
+/* =====================================================================
+   6) KALIP GEOMETRİLERİ
+   Plaka koordinatları: sol-alt köşe (0,0). Pim flanşı sol ve alt kenarda,
+   L-dayama flanşın hemen içinde. Kağıt L-köşeye yaslanır; flanştaki
+   pimlere asla ulaşamaz. Z yukarı.
+   Üst kalıp "montaj çerçevesinde" (yüz z=0, aşağı bakar) kurulur;
+   baskı için gerektiğinde X ekseni etrafında 180° döndürülür.
+   ===================================================================== */
+// Tüm geometri "kanonik" çerçevede kurulur: dayama sol-alt köşede (L) ya da alt kenarda (düz).
+// Seçilen köşe/kenar için sonuç plaka merkezi etrafında k×90° döndürülür (ayna değil).
+const CORNER_K = { bl: 0, br: 1, tr: 2, tl: 3 }, EDGE_K = { bottom: 0, right: 1, top: 2, left: 3 };
+function layout() {
+  const edge = P.stopType === 'edge';
+  const k = edge ? (EDGE_K[P.stopEdge] || 0) : (CORNER_K[P.stopCorner] || 0);
+  const Wwld = P.baseW, Lwld = P.baseL;
+  const W = k % 2 ? Lwld : Wwld, L = k % 2 ? Wwld : Lwld;   // kanonik ölçüler
+  const F = P.flangeW, t = P.wallT;
+  const holeD = P.guideD + P.pinTol;
+  const m = Math.max(F / 2, holeD / 2 + 2.5);
+  const pins = edge ? [{ x: m, y: F / 2 }, { x: W - m, y: F / 2 }] : [{ x: F / 2, y: L - F / 2 }, { x: W - F / 2, y: F / 2 }];
+  const ox = edge ? 0 : F + t, oy = F + t; // kağıt köşesi / kenarı (çalışma alanı başlangıcı)
+  // dünya ↔ kanonik dönüşümleri
+  const toWorld = (x, y) => {
+    const u = x - W / 2, v = y - L / 2;
+    const r = k === 1 ? [-v, u] : k === 2 ? [-u, -v] : k === 3 ? [v, -u] : [u, v];
+    return [r[0] + Wwld / 2, r[1] + Lwld / 2];
+  };
+  const toCanon = (X, Y) => {
+    const u = X - Wwld / 2, v = Y - Lwld / 2;
+    const r = k === 1 ? [v, -u] : k === 2 ? [-u, -v] : k === 3 ? [-v, u] : [u, v];
+    return [r[0] + W / 2, r[1] + L / 2];
+  };
+  return { W, L, Wwld, Lwld, F, t, k, edge, holeD, pins, ox, oy, cx: W / 2, cy: L / 2, toWorld, toCanon };
+}
+const wallPoly = G => G.edge ? rect(0, G.F, G.W, G.F + G.t)
+  : [pt(G.F, G.F), pt(G.W, G.F), pt(G.W, G.F + G.t), pt(G.F + G.t, G.F + G.t), pt(G.F + G.t, G.L), pt(G.F, G.L)];
+function groovePoly(G) {
+  const g = P.wallGap, a = G.F - g, b = G.F + G.t + g;
+  if (G.edge) return rect(-1, a, G.W + 1, b);
+  return [pt(a, a), pt(G.W + 1, a), pt(G.W + 1, b), pt(b, b), pt(b, G.L + 1), pt(a, G.L + 1)];
+}
+// Tasarım merkezinin kanonik konumu (A = designX, B = designY; dünyaya göre anlamlı)
+function designPos(G) {
+  const A = P.designX, B = P.designY;
+  if (G.edge) return [(G.k === 2 || G.k === 3) ? G.W - A : A, G.oy + B];
+  return G.k % 2 ? [G.ox + B, G.oy + A] : [G.ox + A, G.oy + B];
+}
+function ring(R, T) {
+  if (T <= 0 || R <= 0) return [];
+  const Ri = Math.max(0, R - T);
+  return Ri > 0 ? difference([circle(0, 0, R, segs(R))], [circle(0, 0, Ri, segs(Ri))]) : region([circle(0, 0, R, segs(R))]);
+}
+function rotPaths(paths, deg, cx = 0, cy = 0) {
+  const a = deg2rad(deg % 360);
+  if (Math.abs(a) < 1e-9) return paths;
+  const c = Math.cos(a), s = Math.sin(a);
+  return paths.map(p => p.map(v => { const x = v.X - cx, y = v.Y - cy; return { X: Math.round(cx + x * c - y * s), Y: Math.round(cy + x * s + y * c) }; }));
+}
+
+/* ---------- Katman yüksekliği ve eğim ---------- */
+const LH = () => Math.max(0.02, P.layerH || 0.08);
+const snap = v => Math.max(LH(), Math.round(v / LH() - 1e-9) * LH());
+const effH = () => snap(P.embossH);
+const effCD = () => Math.max(snap(P.cavityD), LH());
+const tanD = () => Math.tan(deg2rad(Math.min(Math.max(P.draft, 0), 60)));
+// [h0,h1] kademe listesi (mm). Eğim varsa her kademe bir yazıcı katmanı kalınlığında.
+function stepList(H) {
+  if (P.draft <= 0) return [[0, H]];
+  let n = Math.max(1, Math.round(H / LH()));
+  const group = Math.ceil(n / (Q.preview ? 3 : 14));   // önizlemede en fazla 3, tam kalitede ~14 kademe
+  const out = [];
+  for (let k = 0; k < n; k += group) out.push([H * k / n, H * Math.min(n, k + group) / n]);
+  return out;
+}
+
+/* ---------- Büyük dolu alanlar: kontur / tarama ---------- */
+// Kaba ve hızlı içe offset (yalnız tespit için): köşeli birleşim, seyreltilmiş kontur
+function roughInset(paths, d) {
+  const co = new CL.ClipperOffset(2, 200);
+  co.AddPaths(CL.Clipper.CleanPolygons(paths, 15), CL.JoinType.jtSquare, CL.EndType.etClosedPolygon);
+  const out = new CL.Paths();
+  co.Execute(out, -d);
+  return out.filter(p => p.length >= 3);
+}
+function bigCore(paths) {
+  // yalnız kutusu Ø bigD'den büyük şekiller aday olabilir
+  const minBox = U(P.bigD);
+  const cand = groupShapes(paths).filter(sh => { const b = bboxOf(sh.outer); return b.x1 - b.x0 >= minBox && b.y1 - b.y0 >= minBox; });
+  if (!cand.length) return { seeds: [], core: [] };
+  const candPaths = cand.flatMap(sh => [sh.outer, ...sh.holes]);
+  if (!roughInset(candPaths, U(P.bigD / 2) - 50).length) return { seeds: [], core: [] };
+  const seeds = offsetPaths(candPaths, -U(P.bigD / 2));
+  if (!seeds.length) return { seeds, core: [] };
+  const core = offsetPaths(candPaths, -U(P.outlineW));
+  const sb = seeds.map(bboxOf);
+  const shapes = treeShapes(clipOp(CL.ClipType.ctUnion, core, null, NZ, true)).filter(sh => {
+    const b = bboxOf(sh.outer);
+    return seeds.some((sd, i) => signedArea(sd) > 0 && sb[i].x0 >= b.x0 && sb[i].x1 <= b.x1 && sb[i].y0 >= b.y0 && sb[i].y1 <= b.y1 &&
+      CL.Clipper.PointInPolygon(sd[0], sh.outer) === 1 && !sh.holes.some(h => CL.Clipper.PointInPolygon(sd[0], h) === 1));
+  });
+  return { seeds, core: shapesToPaths(shapes) };
+}
+function hatchStripes(paths) {
+  const b = bounds(paths);
+  const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2, R = Math.hypot(b.x1 - b.x0, b.y1 - b.y0) / 2 + U(1);
+  const a = deg2rad(P.hatchA), ux = Math.cos(a), uy = Math.sin(a), vx = -uy, vy = ux;
+  const hw = U(P.hatchW) / 2, step = U(Math.max(P.hatchS, P.hatchW + 0.3));
+  const out = [];
+  for (let t = -R; t <= R; t += step) {
+    const p = (s, w) => ({ X: Math.round(cx + vx * (t + w) + ux * s), Y: Math.round(cy + vy * (t + w) + uy * s) });
+    out.push([p(-R, -hw), p(R, -hw), p(R, hw), p(-R, hw)]);
+  }
+  return out;
+}
+function applyFill(paths) {
+  if (P.fillMode === 'solid' || !paths.length) return { paths, changed: 0, core: [] };
+  const { core } = bigCore(paths);
+  if (!core.length) return { paths, changed: 0, core: [] };
+  const rest = difference(paths, core);
+  if (P.fillMode === 'outline') return { paths: rest, changed: areaMM2(core), core };
+  const stripes = intersection(offsetPaths(core, U(P.outlineW / 2)), hatchStripes(core), 2000);
+  return { paths: region(rest.concat(stripes), 2000), changed: areaMM2(core), core };
+}
+
+/* ---------- Kompozisyon: logo + yazı + halkalar, seviyelere ayrılmış ---------- */
+let rawLogo = null;
+// inp.text: yazı konturları (yerel merkez 0,0), STATE.logo: SVG seviyeleri
+function composeDesign(inp, G) {
+  const items = [];   // {frac, paths}  (tasarım merkezi = 0,0)
+  const rawLogo = STATE.logo;
+  if (P.logoOn && rawLogo) {
+    const b = rawLogo.b, k = (P.logoW * S) / (b.x1 - b.x0);
+    const mx = (b.x0 + b.x1) / 2, my = (b.y0 + b.y1) / 2;
+    for (const lv of rawLogo.levels) {
+      const local = lv.paths.map(p => p.map(v => ({ X: Math.round((v.X - mx) * k), Y: Math.round((v.Y - my) * k) })));
+      items.push({ frac: P.multiLevel ? lv.frac : 1, paths: translate(rotPaths(local, P.logoRot), U(P.logoDX), U(P.logoDY)) });
+    }
+  }
+  const circ = P.textMode === 'circle';
+  if (inp.text && inp.text.length && P.textMode !== 'none') {
+    items.push({ frac: P.textLevel / 100, paths: translate(rotPaths(region(inp.text), P.textRot), U(P.textDX), U(P.textDY)) });
+  }
+  const rdx = circ ? U(P.textDX) : 0, rdy = circ ? U(P.textDY) : 0;
+  if (P.frameOn) items.push({ frac: P.ringLevel / 100, paths: translate(ring(P.frameR, P.frameT), rdx, rdy) });
+  if (P.innerOn) items.push({ frac: P.ringLevel / 100, paths: translate(ring(P.innerR, P.innerT), rdx, rdy) });
+
+  // aynı seviyeleri birleştir, büyük alan dolgusunu uygula
+  const byFrac = new Map();
+  for (const it of items) {
+    const f = Math.min(1, Math.max(0.05, Math.round(it.frac * 100) / 100));
+    byFrac.set(f, (byFrac.get(f) || []).concat(it.paths));
+  }
+  let levels = [], filled = 0, cores = [];
+  for (const [frac, paths] of byFrac) {
+    const fr = applyFill(region(paths, 2000));
+    filled += fr.changed; cores = cores.concat(fr.core);
+    if (fr.paths.length) levels.push({ frac, paths: fr.paths });
+  }
+  // Üst üste binen seviyelerde yüksek olan kazanır: alçak seviyeden yüksek seviyenin alanı çıkarılır
+  levels.sort((a, b) => b.frac - a.frac);
+  let above = [];
+  levels = levels.map(l => {
+    const own = above.length ? difference(l.paths, above, 2000) : l.paths;
+    above = above.concat(l.paths);
+    return { frac: l.frac, paths: own };
+  }).filter(l => l.paths.length);
+  let all = region(levels.flatMap(l => l.paths), 2000);
+  const bigRaw = P.fillMode === 'solid' ? areaMM2(bigCore(all).seeds) : 0;
+  if (!all.length) return { levels: [], all: [], cores: [], w: 0, h: 0, bx: [0, 0, 0, 0], filled, bigRaw };
+  // tüm tasarımı döndür, aynala; dünya yönünde ölç; sonra kanonik çerçeveye çevir ve yerleştir
+  const mir = paths => paths.map(p => p.map(v => ({ X: -v.X, Y: v.Y })).reverse());
+  const world = paths => { const r = rotPaths(paths, P.designRot); return P.mirror ? mir(r) : r; };
+  levels = levels.map(l => ({ frac: l.frac, paths: world(l.paths) }));
+  all = world(all); cores = world(cores);
+  const b = bounds(all);
+  const bx = [b.x0 / S, b.y0 / S, b.x1 / S, b.y1 / S];   // dünya yönünde, tasarım merkezine göre
+  const [px, py] = designPos(G);
+  const place = paths => translate(rotPaths(paths, -90 * G.k), U(px), U(py));
+  levels = levels.map(l => ({ frac: l.frac, paths: place(l.paths) }));
+  all = place(all);
+  cores = place(cores);
+  return { levels, all, cores, w: bx[2] - bx[0], h: bx[3] - bx[1], bx, filled, bigRaw };
+}
+function centroid(paths) {
+  let A = 0, cx = 0, cy = 0;
+  for (const p of paths) for (let i = 0, n = p.length; i < n; i++) {
+    const a = p[i], b = p[(i + 1) % n], c = a.X * b.Y - b.X * a.Y;
+    A += c; cx += (a.X + b.X) * c; cy += (a.Y + b.Y) * c;
+  }
+  if (Math.abs(A) < 1) return null;
+  return { x: cx / (3 * A) / S, y: cy / (3 * A) / S };
+}
+
+/* ---------- Pres ekseni (M8 + Ø12) ---------- */
+function computeAxis(comp, G) {
+  const spec = THREADS[P.threadSize] || THREADS.M8;
+  const rUp = P.upperType === 'nut' ? (spec.af + P.nutClear) / Math.sqrt(3) : (spec.d + P.threadClear) / 2 + 0.6;
+  const rLow = P.lowerType === 'hole' ? P.lowerHoleD / 2 : P.pressPinD / 2;
+  const Rc = Math.max(rUp, rLow) + 1.5;
+  const box = { x0: (G.edge ? 1 : G.ox + P.wallGap) + Rc, x1: G.W - Rc, y0: G.oy + P.wallGap + Rc, y1: G.L - Rc };
+  const load = centroid(comp.all) || { x: G.cx, y: G.cy };
+  let x, y;
+  if (P.axisMode === 'manual') [x, y] = G.toCanon(P.axisX, P.axisY);
+  else if (P.axisMode === 'center') { x = G.cx; y = G.cy; }
+  else { x = load.x; y = load.y; }
+  const inside = x >= box.x0 - 1e-6 && x <= box.x1 + 1e-6 && y >= box.y0 - 1e-6 && y <= box.y1 + 1e-6;
+  if (P.axisMode === 'auto' && box.x1 >= box.x0 && box.y1 >= box.y0) {
+    x = Math.min(Math.max(x, box.x0), box.x1); y = Math.min(Math.max(y, box.y0), box.y1);
+  }
+  x = Math.round(x * 100) / 100; y = Math.round(y * 100) / 100;
+  return { x, y, load, offset: Math.hypot(load.x - x, load.y - y), inside: P.axisMode === 'auto' ? true : inside, box, Rc };
+}
+
+/* ---------- Erkek desen (kademeli eğim) ve dişi oyuk ---------- */
+// Desen katıları: zBase'ten dir yönünde yükselir; tabanda geniş, tepede dar.
+function patternSolids(levels, zBase, dir) {
+  const out = [], tz = tanD(), H = effH();
+  for (const lv of levels) {
+    const Ht = snap(H * lv.frac);
+    for (const [h0, h1] of stepList(Ht)) {
+      const off = Ht * tz / 2 - ((h0 + h1) / 2) * tz;
+      const reg = offsetPaths(lv.paths, U(off));
+      if (!reg.length) continue;
+      const za = zBase + dir * U(h0), zb = zBase + dir * U(h1);
+      out.push({ z0: Math.min(za, zb), z1: Math.max(za, zb), paths: reg });
+    }
+  }
+  return out;
+}
+// Oyuk kesimleri: yüzey zFace'ten dir yönünde derinleşir; ağızda geniş.
+function cavityCuts(levels, zFace, dir) {
+  const out = [], tz = tanD(), H = effH(), cd = effCD(), p = P.paperOff;
+  let face = [];
+  for (const lv of levels) {
+    const Ht = snap(H * lv.frac);
+    const depth = Math.max(LH(), snap(cd - (H - Ht)));
+    stepList(depth).forEach(([s0, s1], j) => {
+      const h = Math.min((s0 + s1) / 2 + p, Ht);
+      const reg = offsetPaths(lv.paths, U(p + Ht * tz / 2 - h * tz));
+      if (!reg.length) return;
+      if (j === 0) face = face.concat(reg);
+      const za = zFace + dir * U(s0), zb = zFace + dir * U(s1);
+      out.push({ z0: Math.min(za, zb), z1: Math.max(za, zb), paths: reg });
+    });
+  }
+  return { cuts: out, face: region(face) };
+}
+function levelInfo(levels) {
+  const H = effH(), cd = effCD();
+  return levels.map(l => { const Ht = snap(H * l.frac); return { frac: l.frac, Ht, depth: Math.max(LH(), snap(cd - (H - Ht))) }; });
+}
+// Arka yazı konturları ana sayfada üretilir (merkez 0,0); burada aynalanıp yerleştirilir
+function backText(paths, cx, cy, mirror) {
+  if (!paths || !paths.length) return [];
+  const p = mirror ? paths.map(q => q.map(v => ({ X: -v.X, Y: v.Y })).reverse()) : paths;
+  return region(translate(p, U(cx), U(cy)));
+}
+// Arka yazıyı pres bağlantısından uzak kenara koy
+const backY = (G, AX) => AX.y > G.L / 2 ? G.L * 0.17 : G.L * 0.83;
+
+function buildLower(comp, G, inp, AX) {
+  const T = P.lowerT;
+  const base = P.lowerType === 'pin' ? P.pressPinL : 0;
+  const zTop = base + T;
+  const solids = [], cuts = [], profiles = [], warns = [];
+  let pinDepth = 0;
+  if (P.lowerType === 'pin') solids.push({ z0: 0, z1: U(base), paths: [circle(AX.x, AX.y, P.pressPinD / 2, 96)] });
+  solids.push({ z0: U(base), z1: U(zTop), paths: [rect(0, 0, G.W, G.L)] });
+  let lhd = 0;
+  if (P.lowerType === 'hole') {
+    lhd = Math.min(P.lowerHoleDepth, T - 1);
+    if (lhd < P.lowerHoleDepth) warns.push(`Alt pres deliği derinliği ${lhd.toFixed(1)} mm ile sınırlandı (plakada ≥1 mm et).`);
+    cuts.push({ z0: 0, z1: U(lhd), paths: [circle(AX.x, AX.y, P.lowerHoleD / 2, 96, true)] });
+  }
+  let back = [];
+  if (P.backOn) {
+    back = backText(inp.backLower, G.cx, backY(G, AX), true);
+    if (back.length) cuts.push({ z0: U(base), z1: U(base + Math.min(snap(P.backDepth), T / 3)), paths: back });
+  }
+  solids.push({ z0: U(zTop), z1: U(zTop + P.wallH), paths: [wallPoly(G)] });
+  let cavFace = [];
+  if (P.relief === 'emboss') solids.push(...patternSolids(comp.levels, U(zTop), +1));
+  else { const c = cavityCuts(comp.levels, U(zTop), -1); cuts.push(...c.cuts); cavFace = c.face; }
+  const r = P.guideD / 2;
+  if (P.guideType === 'printed') {
+    const cham = Math.min(P.pinChamfer, r * 0.8, P.guideH * 0.5);
+    const prismTop = zTop + P.guideH - cham;
+    for (const p of G.pins) {
+      solids.push({ z0: U(zTop), z1: U(prismTop), paths: [circle(p.x, p.y, r, 48)] });
+      if (cham > 0) profiles.push(frustum(p.x, p.y, r, r - cham, prismTop, zTop + P.guideH));
+    }
+  } else {
+    const rh = (P.guideD + P.pressFit) / 2;
+    const c = Math.min(0.3, P.holeChamfer);
+    let d;
+    if (P.lowerHoleMode === 'through') d = T;
+    else { d = Math.min(P.lowerPinDepth, T - 1.2); if (d < P.lowerPinDepth) warns.push(`Alt pim deliği derinliği ${d.toFixed(1)} mm ile sınırlandı; boydan boya seçebilirsiniz.`); }
+    cuts.push({ z0: U(zTop - d), z1: U(zTop - c), paths: G.pins.map(p => circle(p.x, p.y, rh, 48, true)) });
+    if (c > 0) for (const p of G.pins) profiles.push(holeCham(p.x, p.y, rh, c, zTop, -1));
+    pinDepth = d;
+  }
+  const res = stack({ solids, cuts, profiles });
+  const li = levelInfo(comp.levels);
+  Object.assign(res, { zTop, lhd, back, cavFace, warns, levels: li, pinDepth,
+    zone: P.relief === 'emboss' ? { z0: zTop, z1: zTop + effH(), keep: li.map(l => zTop + l.Ht) } : { z0: zTop - effCD(), z1: zTop, keep: li.map(l => zTop - l.depth) },
+    height: zTop + Math.max(P.wallH, P.relief === 'emboss' ? effH() : 0, P.guideType === 'printed' ? P.guideH : 0) });
+  return res;
+}
+
+function buildUpper(comp, G, inp, AX) {
+  const T = P.upperT;
+  const spec = THREADS[P.threadSize] || THREADS.M8;
+  const solids = [{ z0: 0, z1: U(T), paths: [rect(0, 0, G.W, G.L)] }];
+  const cuts = [], profiles = [], warns = [];
+  const emb = P.relief === 'emboss';
+  let cavFace = [], cd = 0;
+  if (emb) { const c = cavityCuts(comp.levels, 0, +1); cuts.push(...c.cuts); cavFace = c.face; cd = effCD(); }
+  else solids.push(...patternSolids(comp.levels, 0, -1));
+  // Kılavuz delikleri (ağız pahlı), L-duvar kanalı
+  const rh = G.holeD / 2;
+  const c = Math.min(P.holeChamfer, 1);
+  let hd;
+  if (P.upperHoleMode === 'through') hd = T;
+  else {
+    hd = Math.min(P.guideH + P.holeExtra, T - 0.8);
+    if (hd < P.guideH + P.holeExtra - 1e-6) warns.push(`Üst pim deliği derinliği ${hd.toFixed(1)} mm ile sınırlandı (plaka ${T} mm). Boydan boya seçebilir veya plakayı kalınlaştırabilirsiniz.`);
+    if (hd < P.guideH + 0.2) warns.push('Üst pim deliği pimden kısa: kalıp tam kapanmaz!');
+  }
+  const holes = G.pins.map(p => circle(p.x, p.y, rh, 48, true));
+  cuts.push({ z0: U(c), z1: U(hd), paths: holes });
+  if (c > 0) for (const p of G.pins) profiles.push(holeCham(p.x, p.y, rh, c, 0, +1));
+  const gd = Math.min(Math.max(P.wallH - P.paperOff, 0) + P.grooveClear, T - 1);
+  cuts.push({ z0: 0, z1: U(gd), paths: [groovePoly(G)] });
+  // Pres bağlantısı
+  let nd = 0, thd = 0;
+  const hex = hexagon(AX.x, AX.y, spec.af + P.nutClear);
+  if (P.upperType === 'nut') {
+    nd = Math.min(P.nutDepth, T - 0.8);
+    cuts.push({ z0: U(T - nd), z1: U(T), paths: [hex] });
+  } else if (P.upperType === 'thread') {
+    thd = Math.min(P.thrDepth, T - 0.5, emb ? T - cd - 0.6 : T - 0.5);
+    if (thd < P.thrDepth) warns.push(`Dişli delik derinliği ${thd.toFixed(1)} mm ile sınırlandı. Üst plakayı kalınlaştırın.`);
+    if (thd > 0.5) profiles.push(thread(AX.x, AX.y, 'int', spec, P.threadClear, T - thd, T, { top: true, cham: 0.6 }));
+  } else {
+    profiles.push(thread(AX.x, AX.y, 'ext', spec, P.threadClear, T, T + P.studLen, { top: true, cham: Math.min(0.8, spec.p) }));
+  }
+  let back = [];
+  if (P.backOn) {
+    back = backText(inp.backUpper, G.cx, backY(G, AX), false);
+    if (back.length) cuts.push({ z0: U(T - Math.min(snap(P.backDepth), T / 3)), z1: U(T), paths: back });
+  }
+  const res = stack({ solids, cuts, profiles });
+  const li = levelInfo(comp.levels);
+  const faceDown = P.upperType === 'stud' && emb;
+  Object.assign(res, { cavFace, holes, hex: P.upperType === 'nut' ? [hex] : [], nd, thd, hd, gd, cd, back, spec, warns, faceDown, levels: li,
+    zone: emb ? { z0: 0, z1: effCD(), keep: li.map(l => l.depth) } : { z0: -effH(), z1: 0, keep: li.map(l => -l.Ht) },
+    height: res.zMax - res.zMin });
+  return res;
+}
+// Üst kalıbın baskı yönüne dönüşümü: yüz aşağı (öteleme) ya da X ekseni etrafında 180°
+function upperPrintMap(d) {
+  return d.faceDown ? (x, y, z) => [x, y, z - d.zMin] : (x, y, z) => [x, P.baseL - y, d.zMax - z];
+}
+
+// Ek parçalar (dişi seçeneklerin içine basılacak parçalar)
+function buildInserts(G, lower, upper, AX) {
+  const list = [];
+  const spec = upper.spec;
+  const T = P.upperT;
+  if (P.lowerType === 'hole') {
+    const len = lower.lhd - 0.3 + P.pressPinL;
+    list.push({ key: 'presspin', label: 'Pres pimi', file: 'ek_pres_pimi.stl', res: pinPart(P.pressPinD / 2, len, 0.6, 0.6, 96),
+      mount: 'lower', at: [AX.x, AX.y, -P.pressPinL] });
+  }
+  if (P.guideType === 'steel') {
+    const d = lower.pinDepth;
+    const res = pinPart(P.guideD / 2, d + P.guideH, Math.min(P.pinChamfer, P.guideD * 0.4), 0.3);
+    G.pins.forEach((p, i) => list.push({ key: 'guide' + i, label: 'Kılavuz pimi ' + (i + 1), file: `ek_kilavuz_pimi_${i + 1}.stl`, res,
+      mount: 'lower', at: [p.x, p.y, lower.zTop - d] }));
+  }
+  if (P.upperType === 'thread' && upper.thd > 0.5) {
+    const sl = upper.thd - 0.5 + P.studLen;
+    list.push({ key: 'stud', label: 'Saplama ' + P.threadSize, file: `ek_saplama_${P.threadSize}.stl`,
+      res: stack({ profiles: [thread(0, 0, 'ext', spec, P.threadClear, 0, sl, { top: true, bot: true, cham: Math.min(0.8, spec.p) })] }),
+      mount: 'upper', at: [AX.x, AX.y, T - upper.thd + 0.5] });
+  }
+  if (P.upperType === 'nut') {
+    const h = upper.nd - 0.3;
+    list.push({ key: 'nut', label: 'Somun ' + P.threadSize, file: `ek_somun_${P.threadSize}.stl`,
+      res: stack({ solids: [{ z0: 0, z1: U(h), paths: [hexagon(0, 0, spec.af)] }], profiles: [thread(0, 0, 'int', spec, P.threadClear, 0, h, { top: true, bot: true, cham: 0.4 })] }),
+      mount: 'upper', at: [AX.x, AX.y, T - upper.nd] });
+    const sl = h + P.studLen;
+    list.push({ key: 'stud', label: 'Saplama ' + P.threadSize, file: `ek_saplama_${P.threadSize}.stl`,
+      res: stack({ profiles: [thread(0, 0, 'ext', spec, P.threadClear, 0, sl, { top: true, bot: true, cham: Math.min(0.8, spec.p) })] }),
+      mount: 'upper', at: [AX.x, AX.y, T - upper.nd] });
+  }
+  return list;
+}
+
+function buildCoupon(labels) {
+  const W = 56, H = 38, T = 6;
+  const cuts = [];
+  const tols = [0.1, 0.2, 0.3, 0.4, 0.5];
+  const spec = THREADS[P.threadSize] || THREADS.M8;
+  tols.forEach((t, i) => cuts.push({ z0: U(1), z1: U(T), paths: [circle(8 + i * 10, 27, (P.guideD + t) / 2, 48, true)] }));
+  [0.1, 0.2, 0.3].forEach((t, i) => cuts.push({ z0: U(T - Math.min(4.5, spec.af * 0.45)), z1: U(T), paths: [hexagon(10 + i * 18, 10, spec.af + t)] }));
+  if (labels && labels.length) cuts.push({ z0: U(T - 0.4), z1: U(T), paths: region(labels) });
+  const plate = stack({ solids: [{ z0: 0, z1: U(T), paths: [rect(0, 0, W, H)] }], cuts });
+  const pin = pinPart(P.guideD / 2, 10, Math.min(P.pinChamfer, P.guideD * 0.4), 0.3);
+  // tek STL içinde iki ayrı kapalı gövde
+  const pos = new Float32Array(plate.pos.length + pin.pos.length);
+  pos.set(plate.pos);
+  for (let i = 0; i < pin.pos.length; i += 3) { pos[plate.pos.length + i] = pin.pos[i] + W + 8; pos[plate.pos.length + i + 1] = pin.pos[i + 1] + H / 2; pos[plate.pos.length + i + 2] = pin.pos[i + 2]; }
+  const off = plate.pos.length / 3;
+  const idx = new Uint32Array(plate.idx.length + pin.idx.length);
+  idx.set(plate.idx);
+  for (let i = 0; i < pin.idx.length; i++) idx[plate.idx.length + i] = pin.idx[i] + off;
+  return { pos, idx };
+}
+
+
+/* =====================================================================
+   7) TOPLU HESAP (işçi iş parçacığında çalışır)
+   ===================================================================== */
+const STATE = { logo: null, logoVer: null, memo: {} };
+const UI_ONLY = ['ticketW', 'ticketH', 'minLine', 'minRib', 'paper'];
+const UPPER_ONLY = ['upperType', 'threadSize', 'studLen', 'threadClear', 'nutDepth', 'nutClear', 'thrDepth', 'upperT', 'upperHoleMode', 'holeExtra', 'pinTol', 'grooveClear', 'wallGap'];
+const LOWER_ONLY = ['lowerT', 'lowerType', 'pressPinD', 'pressPinL', 'lowerHoleD', 'lowerHoleDepth', 'lowerHoleMode', 'pressFit', 'lowerPinDepth', 'pinChamfer', 'guideType'];
+const DESIGN_KEYS = ['logoOn', 'logoW', 'logoDX', 'logoDY', 'logoRot', 'multiLevel', 'textMode', 'textDX', 'textDY', 'textRot', 'textLevel',
+  'frameOn', 'frameR', 'frameT', 'innerOn', 'innerR', 'innerT', 'ringLevel', 'fillMode', 'bigD', 'outlineW', 'hatchW', 'hatchS', 'hatchA',
+  'mirror', 'designX', 'designY', 'designRot', 'stopType', 'stopCorner', 'stopEdge', 'baseW', 'baseL', 'flangeW', 'wallT'];
+const keyOf = (skip, extra) => JSON.stringify([Object.keys(P).filter(k => !skip.includes(k)).sort().map(k => P[k]), extra]);
+function memo(name, key, fn) {
+  const m = STATE.memo[name];
+  if (m && m.key === key) return m.val;
+  const val = fn();
+  STATE.memo[name] = { key, val };
+  return val;
+}
+
+// Özellik kenarları (25° üstü kırılma + açık kenarlar), eğim kademeleri hariç
+function featureEdges(pos, idx, zone) {
+  const nf = idx.length / 3, N = new Float32Array(nf * 3);
+  for (let f = 0; f < nf; f++) {
+    const a = idx[f * 3] * 3, b = idx[f * 3 + 1] * 3, c = idx[f * 3 + 2] * 3;
+    const ux = pos[b] - pos[a], uy = pos[b + 1] - pos[a + 1], uz = pos[b + 2] - pos[a + 2];
+    const vx = pos[c] - pos[a], vy = pos[c + 1] - pos[a + 1], vz = pos[c + 2] - pos[a + 2];
+    let nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+    const l = Math.hypot(nx, ny, nz) || 1; N[f * 3] = nx / l; N[f * 3 + 1] = ny / l; N[f * 3 + 2] = nz / l;
+  }
+  const cosT = Math.cos(25 * Math.PI / 180), first = new Map(), out = [];
+  const eps = 1e-4, lh = LH();
+  const inZ = z => zone && z > zone.z0 + eps && z < zone.z1 - eps;
+  const kept = z => zone && zone.keep.some(k => Math.abs(k - z) < eps);
+  const emit = (a, b) => {
+    const z1 = pos[a * 3 + 2], z2 = pos[b * 3 + 2];
+    if (zone) {
+      if (inZ(z1) && inZ(z2) && !(Math.abs(z1 - z2) < eps && kept(z1))) return;
+      if (inZ(z1) !== inZ(z2) && Math.abs(z1 - z2) < lh * 1.01 && !kept(z1) && !kept(z2)) return;
+    }
+    out.push(pos[a * 3], pos[a * 3 + 1], z1, pos[b * 3], pos[b * 3 + 1], z2);
+  };
+  for (let f = 0; f < nf; f++) for (let s = 0; s < 3; s++) {
+    const a = idx[f * 3 + s], b = idx[f * 3 + (s + 1) % 3];
+    const k = a < b ? a * EK + b : b * EK + a;
+    const g = first.get(k);
+    if (g === undefined) { first.set(k, f); continue; }
+    first.delete(k);
+    if (N[f * 3] * N[g * 3] + N[f * 3 + 1] * N[g * 3 + 1] + N[f * 3 + 2] * N[g * 3 + 2] < cosT) emit(a, b);
+  }
+  for (const [k, f] of first) { const a = Math.floor(k / EK); emit(a, k - a * EK); }
+  return new Float32Array(out);
+}
+// Düz bölgeleri üçgen listesine çevir (önizleme katmanları)
+function flatTris(paths, z) {
+  const out = [];
+  for (const sh of treeShapes(clipOp(CL.ClipType.ctUnion, paths, null, NZ, true))) {
+    const rings = [sh.outer, ...sh.holes], flat = [], holes = [], all = [];
+    rings.forEach((r, ri) => { if (ri) holes.push(all.length); for (const p of r) { flat.push(p.X, p.Y); all.push(p); } });
+    const t = self.earcut(flat, holes.length ? holes : null, 2);
+    for (const i of t) out.push(all[i].X / S, all[i].Y / S, z);
+  }
+  return new Float32Array(out);
+}
+// Kanonik → dünya (yerinde, x,y)
+function worldify(arr, G, stride = 3) {
+  if (!G.k) return arr;
+  for (let i = 0; i < arr.length; i += stride) { const w = G.toWorld(arr[i], arr[i + 1]); arr[i] = w[0]; arr[i + 1] = w[1]; }
+  return arr;
+}
+function partOut(res, G) {
+  const edges = featureEdges(res.pos, res.idx, res.zone);
+  const pos = worldify(Float32Array.from(res.pos), G);
+  return { pos, idx: res.idx, edges: worldify(edges, G), triCount: res.triCount, badEdges: res.badEdges, zMin: res.zMin, zMax: res.zMax };
+}
+
+function buildAll(params, inp, quality) {
+  P = params; Q.preview = quality === 'preview';
+  const TM = {}; let _t = Date.now(); const tick = k => { const n = Date.now(); TM[k] = n - _t; _t = n; };
+  const G = layout();
+  if (G.F < G.holeD + 2.5) throw new Error(`Pim flanşı en az ${(G.holeD + 2.5).toFixed(1)} mm olmalı.`);
+  const designKey = JSON.stringify([DESIGN_KEYS.map(k => P[k]), STATE.logoVer, inp.textVer]);
+  const comp = memo('comp', designKey, () => composeDesign(inp, G)); tick('compose');
+  const AX = computeAxis(comp, G);
+  const axKey = [AX.x, AX.y, designKey, inp.backVer, quality];
+  const lower = memo('lower' + quality, keyOf([...UI_ONLY, ...UPPER_ONLY], axKey), () => buildLower(comp, G, inp, AX)); tick('lower');
+  const upper = memo('upper' + quality, keyOf([...UI_ONLY, ...LOWER_ONLY], axKey), () => buildUpper(comp, G, inp, AX)); tick('upper');
+  const insKey = JSON.stringify([lower.lhd, lower.pinDepth, lower.zTop, upper.thd, upper.nd, AX.x, AX.y, G.k, quality,
+    ['threadSize', 'threadClear', 'studLen', 'pressPinD', 'pressPinL', 'guideD', 'guideH', 'pinChamfer', 'guideType', 'upperType', 'lowerType', 'upperT', 'flangeW', 'baseW', 'baseL', 'pinTol', 'stopType'].map(k => P[k])]);
+  const inserts = memo('ins' + quality, insKey, () => buildInserts(G, lower, upper, AX)); tick('inserts');
+
+  const emb = P.relief === 'emboss', H = effH(), cd = effCD();
+  const out = {
+    quality, timings: TM, k: G.k,
+    lower: partOut(lower, G), upper: partOut(upper, G),
+    lowerInfo: { zTop: lower.zTop, lhd: lower.lhd, height: lower.height, levels: lower.levels },
+    upperInfo: { faceDown: upper.faceDown, hd: upper.hd, gd: upper.gd, nd: upper.nd, thd: upper.thd, height: upper.height },
+    inserts: inserts.map(d => {
+      const w = G.toWorld(d.at[0], d.at[1]);
+      return { label: d.label, file: d.file, mount: d.mount, at: [w[0], w[1], d.at[2]], res: partOut(d.res, { k: 0 }) };
+    }),
+    axis: (() => { const a = G.toWorld(AX.x, AX.y), l = G.toWorld(AX.load.x, AX.load.y); return { x: a[0], y: a[1], load: { x: l[0], y: l[1] }, offset: AX.offset }; })(),
+    pins: G.pins.map(p => G.toWorld(p.x, p.y)),
+    ticket: (() => {
+      const tw = G.k % 2 ? P.ticketH : P.ticketW, th = G.k % 2 ? P.ticketW : P.ticketH;
+      const a = G.toWorld(G.ox, G.oy), b = G.toWorld(G.ox + tw, G.oy + th);
+      return { x0: Math.min(a[0], b[0]), y0: Math.min(a[1], b[1]), x1: Math.max(a[0], b[0]), y1: Math.max(a[1], b[1]) };
+    })(),
+    comp: { w: comp.w, h: comp.h, bx: comp.bx },
+    effH: H, effCD: cd, LH: LH(),
+  };
+  if (Q.preview) return out;
+
+  // ---- Tam kalite: kontroller ve ince bölge katmanları ----
+  const design = comp.all;
+  const chk = memo('checks', JSON.stringify([designKey, P.minLine, P.minRib, P.paperOff, P.draft, P.embossH, P.layerH, P.wallGap, P.relief]), () => {
+    const thin = thinParts(design, P.minLine);
+    // boşluk kontrolü yalnız tasarım çevresinde (büyük dış alan gereksiz yere hesaplanmasın)
+    const db = design.length ? bounds(design) : null, mg = U(1.5);
+    const work = db ? [[{ X: Math.max(U(G.ox + P.wallGap), db.x0 - mg), Y: Math.max(U(G.oy + P.wallGap), db.y0 - mg) }, { X: Math.min(U(G.W), db.x1 + mg), Y: Math.max(U(G.oy + P.wallGap), db.y0 - mg) },
+      { X: Math.min(U(G.W), db.x1 + mg), Y: Math.min(U(G.L), db.y1 + mg) }, { X: Math.max(U(G.ox + P.wallGap), db.x0 - mg), Y: Math.min(U(G.L), db.y1 + mg) }]] : [];
+    const gaps = design.length ? difference(work, comp.cores.length ? region(design.concat(comp.cores)) : design) : [];
+    const expand = Math.max(0, P.paperOff + H * tanD() / 2 - Math.min(P.paperOff, H) * tanD());
+    const thinRibs = gaps.length ? thinParts(gaps, P.minRib + 2 * expand, 0.25) : [];
+    return { thin, thinRibs, expand, wallHit: interArea(design, offsetPaths([wallPoly(G)], U(0.3))) };
+  });
+  out.thinTris = worldify(flatTris(chk.thin, lower.zTop + (emb ? H : 0) + 0.03), G);
+  out.ribTris = worldify(flatTris(chk.thinRibs, lower.zTop + 0.03), G);
+
+  const warn = [], W_ = (k, t) => warn.push([k, t]);
+  const thinA = areaMM2(chk.thin), ribA = areaMM2(chk.thinRibs);
+  const cavFace = emb ? upper.cavFace : lower.cavFace;
+  if (inp.fontErr && P.textMode !== 'none') W_('err', 'Font yüklenemedi: ' + inp.fontErr + '. İnternet bağlantısını kontrol edin.');
+  if (!design.length) W_('warn', 'Tasarım boş (logo veya yazı ekleyin).');
+  if (chk.wallHit > 0.0005) W_('err', 'Desen dayama duvarına değiyor/çakışıyor. Tasarımı duvardan uzaklaştırın.');
+  const safe = [rect((G.edge ? 1.2 : G.ox + P.wallGap + 0.8), G.oy + P.wallGap + 0.8, G.W - 1.2, G.L - 1.2)];
+  if (diffArea(cavFace, safe) > 0.001) W_('err', 'Oyuk kalıp kenarına veya duvar kanalına çok yakın/taşıyor. Tasarımı küçültün veya "Tasarımı ortala"ya basın.');
+  if (thinA > 0.3) W_('warn', `İnce çizgi: toplam <b>${thinA.toFixed(2)} mm²</b> bölge ${P.minLine} mm'den ince (kırmızı). Bu kısımlar kağıtta zayıf çıkar: harf yüksekliğini veya çizgi kalınlığını artırın.`);
+  if (ribA > 2.0) W_('warn', `Dar boşluk: toplam <b>${ribA.toFixed(2)} mm²</b> bölgede tasarım boşluğu ${(P.minRib + 2 * chk.expand).toFixed(2)} mm'den dar (turuncu). Bu boşluklar kapanır; harf içleri kaybolabilir: harf aralığını/boyunu artırın.`);
+  if (comp.bigRaw > 0.5) W_('warn', `Büyük dolu alan: ${comp.bigRaw.toFixed(1)} mm² bölgeye Ø${P.bigD} mm daire sığıyor. Geniş dolu kabartma kartonu gerer ve buruşturur; "Kontur" veya "Kontur + tarama" seçin.`);
+  if (comp.filled > 0) W_('info', `${comp.filled.toFixed(1)} mm² büyük alan ${P.fillMode === 'hatch' ? 'kontur + taramaya' : 'kontura'} çevrildi.`);
+  if (!AX.inside) W_('err', `Pres ekseni izinli bölgenin dışında: bağlantı kanal/kenar/pim deliklerine çok yakın.`);
+  if (design.length && AX.offset > 3) W_('warn', `Yük merkezi pres ekseninden <b>${AX.offset.toFixed(1)} mm</b> kaçık: kalıp bastırırken yatabilir, kabartma bir tarafta sığ çıkar.${P.axisMode !== 'auto' ? ' "Otomatik" eksen modunu deneyin.' : ' Eksen izinli bölgenin sınırında; tasarımı merkeze yaklaştırın.'}`);
+  else if (design.length && AX.offset > 1) W_('info', `Yük merkezi eksenden ${AX.offset.toFixed(1)} mm kaçık (kabul edilebilir).`);
+  if (emb && P.upperType === 'nut') {
+    const floor = P.upperT - upper.nd - cd;
+    if (interArea(upper.cavFace, upper.hex) > 0.001 && floor < 1.0)
+      W_('warn', `Oyuk ile somun yuvası arasında yalnızca <b>${floor.toFixed(2)} mm</b> et kalıyor. Üst plakayı <b>${(upper.nd + cd + 1).toFixed(1)} mm</b> yapın.`);
+  }
+  if (!emb && P.lowerType === 'hole') {
+    const floor = P.lowerT - lower.lhd - cd;
+    if (interArea(lower.cavFace, [circle(AX.x, AX.y, P.lowerHoleD / 2, 64)]) > 0.001 && floor < 1.0)
+      W_('warn', `Alt oyuk ile pres deliği arasında yalnızca <b>${floor.toFixed(2)} mm</b> et kalıyor. Alt plakayı kalınlaştırın veya delik derinliğini azaltın.`);
+  }
+  for (const t of [...lower.warns, ...upper.warns]) W_('warn', t);
+  if (!emb && P.upperType === 'stud') W_('warn', 'Ters kabartma + entegre cıvata: üst kalıp desen yukarı basılır, cıvata alta gelir ve <b>destek gerekir</b>. Desteksiz baskı için "Somun yuvası" veya "Dişli delik" seçin.');
+  if (P.lowerType === 'pin') W_('info', 'Entegre pres pimi seçili: plaka pimin üstünde havada kalır, <b>destek gerekir</b>. Desteksiz baskı için "Dişi delik + ayrı pim" seçin.');
+  if (cd < H + P.paperOff * 0.5) W_('warn', 'Oyuk sığ: oyuk derinliği ≈ kabartma + kağıt kalınlığı olmalı.');
+  if (P.guideH < P.wallH + 1) W_('warn', 'Kılavuz pimi kısa; kabartma kağıda değmeden önce deliğe girmeli.');
+  if (Math.abs(H - P.embossH) > 0.005 || Math.abs(cd - P.cavityD) > 0.005) W_('info', `Katman yüksekliğine (${LH()} mm) yuvarlandı: kabartma <b>${H.toFixed(2)}</b>, oyuk <b>${cd.toFixed(2)} mm</b>.`);
+  const badT = lower.badEdges + upper.badEdges;
+  if (badT || inserts.some(i => i.res.badEdges))
+    W_('warn', `Ağ kontrolü: ${badT} kenarda şekiller birbirine tam teğet değiyor (genellikle harf/çerçeve teması). Dilimleyiciler bunu otomatik onarır; tamamen temiz dosya için harf aralığını veya yarıçapı 0.1 mm değiştirin.`);
+  if (!warn.some(w => w[0] === 'warn' || w[0] === 'err')) warn.unshift(['ok', 'Tüm kontroller başarılı. Kalıplar baskıya hazır.']);
+  out.warnings = warn;
+  tick('checks');
+  return out;
+}
+function transferables(r) {
+  const t = [];
+  if (!r || !r.lower) return t;
+  for (const p of [r.lower, r.upper, ...r.inserts.map(i => i.res)]) t.push(p.pos.buffer, p.edges.buffer);
+  if (r.thinTris) t.push(r.thinTris.buffer, r.ribTris.buffer);
+  return t;
+}
+function handle(m) {
+  if (m.logo !== undefined) { STATE.logo = m.logo; STATE.logoVer = m.logoVer; }
+  if (m.textData !== undefined) STATE.textData = m.textData;
+  if (m.type === 'build') return buildAll(m.P, Object.assign({}, STATE.textData || {}, m.inp), m.quality);
+  if (m.type === 'coupon') { P = m.P; Q.preview = false; return buildCoupon(m.labels); }
+  return null;
+}
+return { handle, transferables, buildAll, buildCoupon, clipOp, region, bounds, translate, U, S, NZ, EO, CL, THREADS, STATE, Q,
+  setParams: p => { P = p; } };
+
+})();
+</script>
+
+<script type="module">
+import * as THREE from 'three';
+import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+import { SVGLoader } from 'three/addons/loaders/SVGLoader.js';
+import { STLExporter } from 'three/addons/exporters/STLExporter.js';
+import { zipSync } from 'three/addons/libs/fflate.module.js';
+import opentype from 'opentype';
+
+// Geometri çekirdeği (#geomlib) hem arka plan işçisinde hem gerekirse burada çalışır.
+const { clipOp, region, bounds, translate, U, S, NZ, EO, CL, THREADS } = GEOM;
 
 /* =====================================================================
    2) SVG → 2D BÖLGE (koyu = ekle, açık/beyaz = çıkar)
@@ -581,7 +1288,11 @@ function parseSVG(text) {
   if (!items.length || !isFinite(x0)) throw new Error('SVG içinde dolgulu/çizgili bir yol bulunamadı.');
   const R = 100000 / (Math.max(x1 - x0, y1 - y0) || 1);
   const toInt = p => ({ X: Math.round((p.x - x0) * R), Y: Math.round(-(p.y - y0) * R) });
-  const acc = new Map();   // seviye → bölge (üstte boyanan alttakini örter)
+  // seviye → ham konturlar (birleştirme en sonda tek sefer). Üstte boyanan alttakini örter:
+  // yalnız kutusu çakışan seviyelerden çıkarma yapılır.
+  const acc = new Map(), accBox = new Map();
+  const boxOv = (a, b) => a && b && a.x0 <= b.x1 && b.x0 <= a.x1 && a.y0 <= b.y1 && b.y0 <= a.y1;
+  const growBox = (a, b) => a ? { x0: Math.min(a.x0, b.x0), y0: Math.min(a.y0, b.y0), x1: Math.max(a.x1, b.x1), y1: Math.max(a.y1, b.y1) } : b;
   for (const it of items) {
     let reg;
     if (it.type === 'fill') {
@@ -598,8 +1309,14 @@ function parseSVG(text) {
       reg = new CL.Paths();
       co.Execute(reg, it.width / 2 * R);
     }
-    for (const [k, v] of acc) acc.set(k, clipOp(CL.ClipType.ctDifference, v, reg, NZ));
-    if (it.level > 0) acc.set(it.level, clipOp(CL.ClipType.ctUnion, (acc.get(it.level) || []).concat(reg), null, NZ));
+    if (!reg.length) continue;
+    const rb = bounds(reg);
+    for (const [k, v] of acc) {
+      if (k === it.level || !boxOv(accBox.get(k), rb)) continue;
+      acc.set(k, clipOp(CL.ClipType.ctDifference, v, reg, NZ));
+    }
+    if (it.level > 0) { acc.set(it.level, (acc.get(it.level) || []).concat(reg)); accBox.set(it.level, growBox(accBox.get(it.level), rb)); }
+    else for (const [k, v] of acc) if (boxOv(accBox.get(k), rb)) acc.set(k, clipOp(CL.ClipType.ctDifference, v, reg, NZ));
   }
   const levels = [];
   for (const [frac, v] of acc) {
@@ -720,11 +1437,6 @@ function circleText(font, lines, capH, spacing, R) {
   place(lines[1], true);
   return region(polys);
 }
-function ring(R, T) {
-  if (T <= 0 || R <= 0) return [];
-  const Ri = Math.max(0, R - T);
-  return Ri > 0 ? difference([circle(0, 0, R, segs(R))], [circle(0, 0, Ri, segs(Ri))]) : region([circle(0, 0, R, segs(R))]);
-}
 
 /* =====================================================================
    4) PARAMETRELER (bilet kartonuna soğuk mühür için ideal varsayılanlar)
@@ -745,6 +1457,8 @@ const show = {
   upBlind: () => P.upperHoleMode === 'blind',
   back: () => P.backOn,
   manual: () => P.axisMode === 'manual',
+  corner: () => P.stopType === 'corner',
+  edgeStop: () => P.stopType === 'edge',
   fill: () => P.fillMode !== 'solid',
   hatch: () => P.fillMode === 'hatch',
 };
@@ -760,8 +1474,14 @@ const PAPERS = {
 const SECTIONS = [
   { title: '1 · Tasarım Yerleşimi', id: 'place', fields: [
     { k: 'relief', l: 'Kabartma yönü', v: 'emboss', type: 'select', opts: [['emboss', 'Kabartma (desen yükselir)'], ['deboss', 'Ters kabartma (desen gömülür)']] },
-    { k: 'designX', l: 'Tasarım Merkezi X', h: 'L-duvar iç yüzünden', v: 19.5, step: 0.5 },
-    { k: 'designY', l: 'Tasarım Merkezi Y', h: 'L-duvar iç yüzünden', v: 19.5, step: 0.5 },
+    { k: 'stopType', l: 'Kağıt dayaması', v: 'corner', type: 'select', opts: [['corner', 'Köşe (L-duvar)'], ['edge', 'Kenar (düz duvar)']] },
+    { k: 'stopCorner', l: 'Dayama köşesi', h: 'kağıdın yaslanacağı köşe', v: 'bl', type: 'select', opts: [['bl', '↙ Sol-alt'], ['br', '↘ Sağ-alt'], ['tr', '↗ Sağ-üst'], ['tl', '↖ Sol-üst']], show: () => P.stopType === 'corner' },
+    { k: 'stopEdge', l: 'Dayama kenarı', h: 'kağıdın yaslanacağı kenar', v: 'bottom', type: 'select', opts: [['bottom', '↓ Alt'], ['right', '→ Sağ'], ['top', '↑ Üst'], ['left', '← Sol']], show: () => P.stopType === 'edge' },
+    { k: 'designX', l: 'Tasarım Merkezi — Yatay', v: 19.5, step: 0.5,
+      h2: () => P.stopType === 'edge' ? (['left', 'right'].includes(P.stopEdge) ? 'kenar boyunca, alt uçtan' : 'kenar boyunca, sol uçtan') : 'dikey duvarın iç yüzünden' },
+    { k: 'designY', l: 'Tasarım Merkezi — Dikey', v: 19.5, step: 0.5,
+      h2: () => P.stopType === 'edge' ? 'duvarın iç yüzünden' : 'yatay duvarın iç yüzünden' },
+    { k: 'designRot', l: 'Tüm Tasarımı Döndür', h: 'saat yönü tersine', v: 0, step: 5, unit: '°' },
     { k: 'mirror', l: 'Yatay Aynalama (Mirror)', v: false, type: 'bool' },
     { k: 'minLine', l: 'Min. çizgi kalınlığı', h: 'daha incesi kırmızı gösterilir', v: 0.5, min: 0, step: 0.05 },
     { k: 'minRib', l: 'Min. dişi duvar / boşluk', h: 'daha dar boşluk turuncu gösterilir', v: 0.35, min: 0, step: 0.05 },
@@ -775,6 +1495,7 @@ const SECTIONS = [
     { k: 'logoW', l: 'Logo Genişliği', v: 10.5, min: 0.5, step: 0.5, show: show.logo },
     { k: 'logoDX', l: 'Logo X Kaydırma', h: 'tasarım merkezine göre', v: 0, step: 0.25, show: show.logo },
     { k: 'logoDY', l: 'Logo Y Kaydırma', v: 0, step: 0.25, show: show.logo },
+    { k: 'logoRot', l: 'Logo Açısı', h: 'saat yönü tersine', v: 0, step: 5, unit: '°', show: show.logo },
     { k: 'multiLevel', l: 'Gri tonlar = kabartma seviyesi', h: 'siyah %100, koyu gri %75, gri %50, açık gri %25', v: true, type: 'bool', show: show.logo },
   ]},
   { title: '3 · Yazı & Halkalar', id: 'text', fields: [
@@ -789,6 +1510,7 @@ const SECTIONS = [
     { k: 'align', l: 'Hizalama', v: 'center', type: 'select', opts: [['left', 'Sola'], ['center', 'Ortaya'], ['right', 'Sağa']], show: show.flat },
     { k: 'textDX', l: 'Yazı X Kaydırma', h: 'dairesel modda halkalar da kayar', v: 0, step: 0.25, show: show.text },
     { k: 'textDY', l: 'Yazı Y Kaydırma', v: 0, step: 0.25, show: show.text },
+    { k: 'textRot', l: 'Yazı Açısı', h: 'dairesel modda yazı halka üzerinde döner', v: 0, step: 5, unit: '°', show: show.text },
     { k: 'textLevel', l: 'Yazı Kabartma Seviyesi', v: 100, min: 10, step: 5, unit: '%', show: show.text },
     { k: 'frameOn', l: 'Dış çerçeve halkası', v: true, type: 'bool' },
     { k: 'frameR', l: 'Çerçeve Dış Yarıçapı', v: 16.3, min: 1, step: 0.1, show: show.frame },
@@ -955,374 +1677,118 @@ const SAMPLE_SVG = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 100 100
   <circle cx="72.5" cy="30" r="8.5" fill="#fff"/>
 </svg>`;
 
+
 /* =====================================================================
-   6) KALIP GEOMETRİLERİ
-   Plaka koordinatları: sol-alt köşe (0,0). Pim flanşı sol ve alt kenarda,
-   L-dayama flanşın hemen içinde. Kağıt L-köşeye yaslanır; flanştaki
-   pimlere asla ulaşamaz. Z yukarı.
-   Üst kalıp "montaj çerçevesinde" (yüz z=0, aşağı bakar) kurulur;
-   baskı için gerektiğinde X ekseni etrafında 180° döndürülür.
+   6) ARKA PLAN İŞÇİSİ (Web Worker): geometri arayüzü kilitlemeden hesaplanır
    ===================================================================== */
-function layout() {
-  const W = P.baseW, L = P.baseL, F = P.flangeW, t = P.wallT;
-  const holeD = P.guideD + P.pinTol;
-  const pins = [{ x: F / 2, y: L - F / 2 }, { x: W - F / 2, y: F / 2 }];
-  const ox = F + t, oy = F + t; // kağıt köşesi (çalışma alanı başlangıcı)
-  return { W, L, F, t, holeD, pins, ox, oy, cx: W / 2, cy: L / 2 };
+const CDN_LIBS = ['https://cdn.jsdelivr.net/npm/clipper-lib@6.4.2/clipper.js', 'https://cdn.jsdelivr.net/npm/earcut@2.2.4/dist/earcut.min.js'];
+let worker = null, msgSeq = 0, sentLogoVer = null, sentTextVer = null, runningQ = null;
+const waiters = new Map();
+function startWorker() {
+  try {
+    const src = `importScripts(${CDN_LIBS.map(u => JSON.stringify(u)).join(',')});\n${document.getElementById('geomlib').textContent}\n` +
+      `self.onmessage = e => { const m = e.data; try { const r = GEOM.handle(m); self.postMessage({ id: m.id, ok: true, r }, GEOM.transferables(r)); } ` +
+      `catch (err) { self.postMessage({ id: m.id, ok: false, err: String(err && err.message || err) }); } };`;
+    worker = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+    worker.onmessage = e => { const w = waiters.get(e.data.id); if (w) { waiters.delete(e.data.id); w(e.data); } };
+    worker.onerror = e => {
+      console.warn('Arka plan işçisi çalışmadı; hesap ana sayfada yapılacak.', e.message);
+      if (e.preventDefault) e.preventDefault();
+      worker = null; sentLogoVer = sentTextVer = null;
+      for (const [id, w] of waiters) { waiters.delete(id); w({ id, ok: false, retry: true }); }
+    };
+  } catch (e) { worker = null; }
 }
-const wallPoly = G => [pt(G.F, G.F), pt(G.W, G.F), pt(G.W, G.F + G.t), pt(G.F + G.t, G.F + G.t), pt(G.F + G.t, G.L), pt(G.F, G.L)];
-function groovePoly(G) {
-  const g = P.wallGap, a = G.F - g, b = G.F + G.t + g;
-  return [pt(a, a), pt(G.W + 1, a), pt(G.W + 1, b), pt(b, b), pt(b, G.L + 1), pt(a, G.L + 1)];
+startWorker();
+function callGeom(msg) {
+  msg.id = ++msgSeq;
+  if (logoVer !== sentLogoVer) { msg.logo = rawLogo; msg.logoVer = logoVer; }
+  if (textData.ver !== sentTextVer) msg.textData = textData.data;
+  sentLogoVer = logoVer; sentTextVer = textData.ver;
+  if (!worker) {
+    return new Promise(res => setTimeout(() => {
+      try { res({ ok: true, r: GEOM.handle(msg) }); } catch (e) { console.error(e); res({ ok: false, err: e.message }); }
+    }, 0));
+  }
+  return new Promise(res => { waiters.set(msg.id, res); worker.postMessage(msg); });
 }
 
-/* ---------- Katman yüksekliği ve eğim ---------- */
-const LH = () => Math.max(0.02, P.layerH || 0.08);
-const snap = v => Math.max(LH(), Math.round(v / LH() - 1e-9) * LH());
-const effH = () => snap(P.embossH);
-const effCD = () => Math.max(snap(P.cavityD), LH());
-const tanD = () => Math.tan(THREE.MathUtils.degToRad(Math.min(Math.max(P.draft, 0), 60)));
-// [h0,h1] kademe listesi (mm). Eğim varsa her kademe bir yazıcı katmanı kalınlığında.
-function stepList(H) {
-  if (P.draft <= 0) return [[0, H]];
-  let n = Math.max(1, Math.round(H / LH()));
-  const group = Math.ceil(n / 14);          // performans için en fazla ~14 kademe
-  const out = [];
-  for (let k = 0; k < n; k += group) out.push([H * k / n, H * Math.min(n, k + group) / n]);
-  return out;
+/* ---------- Yazı / arka yazı konturları (ana sayfada, font gerektirir) ---------- */
+let rawLogo = null, logoVer = 0, verSeq = 0, curFont = null, fontErr = null;
+let textData = { key: null, ver: 0, data: null };
+async function loadFont() {
+  try { curFont = await getFont(P.font); fontErr = null; } catch (e) { curFont = null; fontErr = e.message; }
+  return curFont;
 }
-
-/* ---------- Büyük dolu alanlar: kontur / tarama ---------- */
-function bigCore(paths) {
-  const seeds = offsetPaths(paths, -U(P.bigD / 2));
-  if (!seeds.length) return { seeds, core: [] };
-  const core = offsetPaths(paths, -U(P.outlineW));
-  const shapes = treeShapes(clipOp(CL.ClipType.ctUnion, core, null, NZ, true))
-    .filter(sh => interArea(shapesToPaths([sh]), seeds) > 0);
-  return { seeds, core: shapesToPaths(shapes) };
-}
-function hatchStripes(paths) {
-  const b = bounds(paths);
-  const cx = (b.x0 + b.x1) / 2, cy = (b.y0 + b.y1) / 2, R = Math.hypot(b.x1 - b.x0, b.y1 - b.y0) / 2 + U(1);
-  const a = THREE.MathUtils.degToRad(P.hatchA), ux = Math.cos(a), uy = Math.sin(a), vx = -uy, vy = ux;
-  const hw = U(P.hatchW) / 2, step = U(Math.max(P.hatchS, P.hatchW + 0.3));
-  const out = [];
-  for (let t = -R; t <= R; t += step) {
-    const p = (s, w) => ({ X: Math.round(cx + vx * (t + w) + ux * s), Y: Math.round(cy + vy * (t + w) + uy * s) });
-    out.push([p(-R, -hw), p(R, -hw), p(R, hw), p(-R, hw)]);
-  }
-  return out;
-}
-function applyFill(paths) {
-  if (P.fillMode === 'solid' || !paths.length) return { paths, changed: 0, core: [] };
-  const { core } = bigCore(paths);
-  if (!core.length) return { paths, changed: 0, core: [] };
-  const rest = difference(paths, core);
-  if (P.fillMode === 'outline') return { paths: rest, changed: areaMM2(core), core };
-  const stripes = intersection(offsetPaths(core, U(P.outlineW / 2)), hatchStripes(core), 2000);
-  return { paths: region(rest.concat(stripes), 2000), changed: areaMM2(core), core };
-}
-
-/* ---------- Kompozisyon: logo + yazı + halkalar, seviyelere ayrılmış ---------- */
-let rawLogo = null;
-function composeDesign(font, G) {
-  const items = [];   // {frac, paths}  (tasarım merkezi = 0,0)
-  if (P.logoOn && rawLogo) {
-    const b = rawLogo.b, k = (P.logoW * S) / (b.x1 - b.x0);
-    const mx = (b.x0 + b.x1) / 2, my = (b.y0 + b.y1) / 2;
-    for (const lv of rawLogo.levels) items.push({ frac: P.multiLevel ? lv.frac : 1,
-      paths: lv.paths.map(p => p.map(v => ({ X: Math.round((v.X - mx) * k + P.logoDX * S), Y: Math.round((v.Y - my) * k + P.logoDY * S) }))) });
-  }
-  const circ = P.textMode === 'circle';
-  if (font && P.textMode !== 'none' && P.text.trim()) {
-    const paths = circ
-      ? translate(circleText(font, P.text.split('\n'), P.capH, P.letterSp, P.textR), U(P.textDX), U(P.textDY))
-      : flatText(font, P.text, P.capH, P.letterSp, P.lineSp, P.align, P.textDX, P.textDY).paths;
-    items.push({ frac: P.textLevel / 100, paths });
-  }
-  const rdx = circ ? U(P.textDX) : 0, rdy = circ ? U(P.textDY) : 0;
-  if (P.frameOn) items.push({ frac: P.ringLevel / 100, paths: translate(ring(P.frameR, P.frameT), rdx, rdy) });
-  if (P.innerOn) items.push({ frac: P.ringLevel / 100, paths: translate(ring(P.innerR, P.innerT), rdx, rdy) });
-
-  // aynı seviyeleri birleştir, büyük alan dolgusunu uygula
-  const byFrac = new Map();
-  for (const it of items) {
-    const f = Math.min(1, Math.max(0.05, Math.round(it.frac * 100) / 100));
-    byFrac.set(f, (byFrac.get(f) || []).concat(it.paths));
-  }
-  let levels = [], filled = 0, cores = [];
-  for (const [frac, paths] of byFrac) {
-    const fr = applyFill(region(paths, 2000));
-    filled += fr.changed; cores = cores.concat(fr.core);
-    if (fr.paths.length) levels.push({ frac, paths: fr.paths });
-  }
-  // Üst üste binen seviyelerde yüksek olan kazanır: alçak seviyeden yüksek seviyenin alanı çıkarılır
-  levels.sort((a, b) => b.frac - a.frac);
-  let above = [];
-  levels = levels.map(l => {
-    const own = above.length ? difference(l.paths, above, 2000) : l.paths;
-    above = above.concat(l.paths);
-    return { frac: l.frac, paths: own };
-  }).filter(l => l.paths.length);
-  let all = region(levels.flatMap(l => l.paths), 2000);
-  const bigRaw = P.fillMode === 'solid' ? areaMM2(bigCore(all).seeds) : 0;
-  if (!all.length) return { levels: [], all: [], cores: [], w: 0, h: 0, bx: [0, 0, 0, 0], filled, bigRaw };
-  const b = bounds(all);
-  const bx = [b.x0 / S, b.y0 / S, b.x1 / S, b.y1 / S];
-  const mir = paths => paths.map(p => p.map(v => ({ X: -v.X, Y: v.Y })).reverse());
-  const ox = U(G.ox + P.designX), oy = U(G.oy + P.designY);
-  const place = paths => translate(P.mirror ? mir(paths) : paths, ox, oy);
-  levels = levels.map(l => ({ frac: l.frac, paths: place(l.paths) }));
-  all = place(all);
-  cores = place(cores);
-  if (P.mirror) { bx[0] = -b.x1 / S; bx[2] = -b.x0 / S; }
-  return { levels, all, cores, w: bx[2] - bx[0], h: bx[3] - bx[1], bx, filled, bigRaw };
-}
-function centroid(paths) {
-  let A = 0, cx = 0, cy = 0;
-  for (const p of paths) for (let i = 0, n = p.length; i < n; i++) {
-    const a = p[i], b = p[(i + 1) % n], c = a.X * b.Y - b.X * a.Y;
-    A += c; cx += (a.X + b.X) * c; cy += (a.Y + b.Y) * c;
-  }
-  if (Math.abs(A) < 1) return null;
-  return { x: cx / (3 * A) / S, y: cy / (3 * A) / S };
-}
-
-/* ---------- Pres ekseni (M8 + Ø12) ---------- */
-function computeAxis(comp, G) {
-  const spec = THREADS[P.threadSize] || THREADS.M8;
-  const rUp = P.upperType === 'nut' ? (spec.af + P.nutClear) / Math.sqrt(3) : (spec.d + P.threadClear) / 2 + 0.6;
-  const rLow = P.lowerType === 'hole' ? P.lowerHoleD / 2 : P.pressPinD / 2;
-  const Rc = Math.max(rUp, rLow) + 1.5;
-  const box = { x0: G.ox + P.wallGap + Rc, x1: G.W - Rc, y0: G.oy + P.wallGap + Rc, y1: G.L - Rc };
-  const load = centroid(comp.all) || { x: G.cx, y: G.cy };
-  let x, y;
-  if (P.axisMode === 'manual') { x = P.axisX; y = P.axisY; }
-  else if (P.axisMode === 'center') { x = G.cx; y = G.cy; }
-  else { x = load.x; y = load.y; }
-  const inside = x >= box.x0 - 1e-6 && x <= box.x1 + 1e-6 && y >= box.y0 - 1e-6 && y <= box.y1 + 1e-6;
-  if (P.axisMode === 'auto' && box.x1 >= box.x0 && box.y1 >= box.y0) {
-    x = Math.min(Math.max(x, box.x0), box.x1); y = Math.min(Math.max(y, box.y0), box.y1);
-  }
-  x = Math.round(x * 100) / 100; y = Math.round(y * 100) / 100;
-  return { x, y, load, offset: Math.hypot(load.x - x, load.y - y), inside: P.axisMode === 'auto' ? true : inside, box, Rc };
-}
-
-/* ---------- Erkek desen (kademeli eğim) ve dişi oyuk ---------- */
-// Desen katıları: zBase'ten dir yönünde yükselir; tabanda geniş, tepede dar.
-function patternSolids(levels, zBase, dir) {
-  const out = [], tz = tanD(), H = effH();
-  for (const lv of levels) {
-    const Ht = snap(H * lv.frac);
-    for (const [h0, h1] of stepList(Ht)) {
-      const off = Ht * tz / 2 - ((h0 + h1) / 2) * tz;
-      const reg = offsetPaths(lv.paths, U(off));
-      if (!reg.length) continue;
-      const za = zBase + dir * U(h0), zb = zBase + dir * U(h1);
-      out.push({ z0: Math.min(za, zb), z1: Math.max(za, zb), paths: reg });
-    }
-  }
-  return out;
-}
-// Oyuk kesimleri: yüzey zFace'ten dir yönünde derinleşir; ağızda geniş.
-function cavityCuts(levels, zFace, dir) {
-  const out = [], tz = tanD(), H = effH(), cd = effCD(), p = P.paperOff;
-  let face = [];
-  for (const lv of levels) {
-    const Ht = snap(H * lv.frac);
-    const depth = Math.max(LH(), snap(cd - (H - Ht)));
-    stepList(depth).forEach(([s0, s1], j) => {
-      const h = Math.min((s0 + s1) / 2 + p, Ht);
-      const reg = offsetPaths(lv.paths, U(p + Ht * tz / 2 - h * tz));
-      if (!reg.length) return;
-      if (j === 0) face = face.concat(reg);
-      const za = zFace + dir * U(s0), zb = zFace + dir * U(s1);
-      out.push({ z0: Math.min(za, zb), z1: Math.max(za, zb), paths: reg });
-    });
-  }
-  return { cuts: out, face: region(face) };
-}
-function levelInfo(levels) {
-  const H = effH(), cd = effCD();
-  return levels.map(l => { const Ht = snap(H * l.frac); return { frac: l.frac, Ht, depth: Math.max(LH(), snap(cd - (H - Ht))) }; });
-}
-function backText(font, str, cx, cy, mirror, maxW) {
+function backPolys(font, str, maxW) {
   if (!font || !str) return [];
   let capH = P.backH;
   const w = layoutLine(font, str, capH, 0.2).width;
   if (w > maxW) capH *= maxW / w;
-  return flatText(font, str, capH, 0.2, 1.3, 'center', cx, cy, mirror).paths;
+  return flatText(font, str, capH, 0.2, 1.3, 'center', 0, 0).paths;
 }
-// Arka yazıyı pres bağlantısından uzak kenara koy
-const backY = (G, AX) => AX.y > G.L / 2 ? G.L * 0.17 : G.L * 0.83;
-
-function buildLower(comp, G, font, AX) {
-  const T = P.lowerT;
-  const base = P.lowerType === 'pin' ? P.pressPinL : 0;
-  const zTop = base + T;
-  const solids = [], cuts = [], profiles = [], warns = [];
-  if (P.lowerType === 'pin') solids.push({ z0: 0, z1: U(base), paths: [circle(AX.x, AX.y, P.pressPinD / 2, 96)] });
-  solids.push({ z0: U(base), z1: U(zTop), paths: [rect(0, 0, G.W, G.L)] });
-  let lhd = 0;
-  if (P.lowerType === 'hole') {
-    lhd = Math.min(P.lowerHoleDepth, T - 1);
-    if (lhd < P.lowerHoleDepth) warns.push(`Alt pres deliği derinliği ${lhd.toFixed(1)} mm ile sınırlandı (plakada ≥1 mm et).`);
-    cuts.push({ z0: 0, z1: U(lhd), paths: [circle(AX.x, AX.y, P.lowerHoleD / 2, 96, true)] });
+function prepTextData(font) {
+  const key = JSON.stringify([P.font, !!font, P.text, P.textMode, P.capH, P.letterSp, P.textR, P.lineSp, P.align, P.backOn, P.backLabel, P.backH, P.baseW, P.baseL]);
+  if (textData.key !== key) {
+    let text = [];
+    if (font && P.textMode !== 'none' && P.text.trim())
+      text = P.textMode === 'circle' ? circleText(font, P.text.split('\n'), P.capH, P.letterSp, P.textR)
+        : flatText(font, P.text, P.capH, P.letterSp, P.lineSp, P.align, 0, 0).paths;
+    const maxW = Math.min(P.baseW, P.baseL) - 10;
+    const lab = P.backLabel ? ' · ' + P.backLabel : '';
+    const data = { text, backLower: P.backOn ? backPolys(font, 'ALT' + lab, maxW) : [], backUpper: P.backOn ? backPolys(font, 'ÜST' + lab, maxW) : [] };
+    textData = { key, ver: ++verSeq, data };
   }
-  let back = [];
-  if (P.backOn) {
-    back = backText(font, 'ALT' + (P.backLabel ? ' · ' + P.backLabel : ''), G.cx, backY(G, AX), true, G.W - 10);
-    if (back.length) cuts.push({ z0: U(base), z1: U(base + Math.min(snap(P.backDepth), T / 3)), paths: back });
-  }
-  solids.push({ z0: U(zTop), z1: U(zTop + P.wallH), paths: [wallPoly(G)] });
-  let cavFace = [];
-  if (P.relief === 'emboss') solids.push(...patternSolids(comp.levels, U(zTop), +1));
-  else { const c = cavityCuts(comp.levels, U(zTop), -1); cuts.push(...c.cuts); cavFace = c.face; }
-  const r = P.guideD / 2;
-  if (P.guideType === 'printed') {
-    const cham = Math.min(P.pinChamfer, r * 0.8, P.guideH * 0.5);
-    const prismTop = zTop + P.guideH - cham;
-    for (const p of G.pins) {
-      solids.push({ z0: U(zTop), z1: U(prismTop), paths: [circle(p.x, p.y, r, 48)] });
-      if (cham > 0) profiles.push(frustum(p.x, p.y, r, r - cham, prismTop, zTop + P.guideH));
-    }
-  } else {
-    const rh = (P.guideD + P.pressFit) / 2;
-    const c = Math.min(0.3, P.holeChamfer);
-    let d;
-    if (P.lowerHoleMode === 'through') d = T;
-    else { d = Math.min(P.lowerPinDepth, T - 1.2); if (d < P.lowerPinDepth) warns.push(`Alt pim deliği derinliği ${d.toFixed(1)} mm ile sınırlandı; boydan boya seçebilirsiniz.`); }
-    cuts.push({ z0: U(zTop - d), z1: U(zTop - c), paths: G.pins.map(p => circle(p.x, p.y, rh, 48, true)) });
-    if (c > 0) for (const p of G.pins) profiles.push(holeCham(p.x, p.y, rh, c, zTop, -1));
-    lower_pinDepth = d;
-  }
-  const res = stack({ solids, cuts, profiles });
-  const li = levelInfo(comp.levels);
-  Object.assign(res, { zTop, lhd, back, cavFace, warns, levels: li,
-    zone: P.relief === 'emboss' ? { z0: zTop, z1: zTop + effH(), keep: li.map(l => zTop + l.Ht) } : { z0: zTop - effCD(), z1: zTop, keep: li.map(l => zTop - l.depth) },
-    height: zTop + Math.max(P.wallH, P.relief === 'emboss' ? effH() : 0, P.guideType === 'printed' ? P.guideH : 0) });
-  return res;
-}
-let lower_pinDepth = 0;
-
-function buildUpper(comp, G, font, AX) {
-  const T = P.upperT;
-  const spec = THREADS[P.threadSize] || THREADS.M8;
-  const solids = [{ z0: 0, z1: U(T), paths: [rect(0, 0, G.W, G.L)] }];
-  const cuts = [], profiles = [], warns = [];
-  const emb = P.relief === 'emboss';
-  let cavFace = [], cd = 0;
-  if (emb) { const c = cavityCuts(comp.levels, 0, +1); cuts.push(...c.cuts); cavFace = c.face; cd = effCD(); }
-  else solids.push(...patternSolids(comp.levels, 0, -1));
-  // Kılavuz delikleri (ağız pahlı), L-duvar kanalı
-  const rh = G.holeD / 2;
-  const c = Math.min(P.holeChamfer, 1);
-  let hd;
-  if (P.upperHoleMode === 'through') hd = T;
-  else {
-    hd = Math.min(P.guideH + P.holeExtra, T - 0.8);
-    if (hd < P.guideH + P.holeExtra - 1e-6) warns.push(`Üst pim deliği derinliği ${hd.toFixed(1)} mm ile sınırlandı (plaka ${T} mm). Boydan boya seçebilir veya plakayı kalınlaştırabilirsiniz.`);
-    if (hd < P.guideH + 0.2) warns.push('Üst pim deliği pimden kısa: kalıp tam kapanmaz!');
-  }
-  const holes = G.pins.map(p => circle(p.x, p.y, rh, 48, true));
-  cuts.push({ z0: U(c), z1: U(hd), paths: holes });
-  if (c > 0) for (const p of G.pins) profiles.push(holeCham(p.x, p.y, rh, c, 0, +1));
-  const gd = Math.min(Math.max(P.wallH - P.paperOff, 0) + P.grooveClear, T - 1);
-  cuts.push({ z0: 0, z1: U(gd), paths: [groovePoly(G)] });
-  // Pres bağlantısı
-  let nd = 0, thd = 0;
-  const hex = hexagon(AX.x, AX.y, spec.af + P.nutClear);
-  if (P.upperType === 'nut') {
-    nd = Math.min(P.nutDepth, T - 0.8);
-    cuts.push({ z0: U(T - nd), z1: U(T), paths: [hex] });
-  } else if (P.upperType === 'thread') {
-    thd = Math.min(P.thrDepth, T - 0.5, emb ? T - cd - 0.6 : T - 0.5);
-    if (thd < P.thrDepth) warns.push(`Dişli delik derinliği ${thd.toFixed(1)} mm ile sınırlandı. Üst plakayı kalınlaştırın.`);
-    if (thd > 0.5) profiles.push(thread(AX.x, AX.y, 'int', spec, P.threadClear, T - thd, T, { top: true, cham: 0.6 }));
-  } else {
-    profiles.push(thread(AX.x, AX.y, 'ext', spec, P.threadClear, T, T + P.studLen, { top: true, cham: Math.min(0.8, spec.p) }));
-  }
-  let back = [];
-  if (P.backOn) {
-    back = backText(font, 'ÜST' + (P.backLabel ? ' · ' + P.backLabel : ''), G.cx, backY(G, AX), false, G.W - 10);
-    if (back.length) cuts.push({ z0: U(T - Math.min(snap(P.backDepth), T / 3)), z1: U(T), paths: back });
-  }
-  const res = stack({ solids, cuts, profiles });
-  const li = levelInfo(comp.levels);
-  const faceDown = P.upperType === 'stud' && emb;
-  Object.assign(res, { cavFace, holes, hex: P.upperType === 'nut' ? [hex] : [], nd, thd, hd, gd, cd, back, spec, warns, faceDown, levels: li,
-    zone: emb ? { z0: 0, z1: effCD(), keep: li.map(l => l.depth) } : { z0: -effH(), z1: 0, keep: li.map(l => -l.Ht) },
-    height: res.zMax - res.zMin });
-  return res;
-}
-// Üst kalıbın baskı yönüne dönüşümü: yüz aşağı (öteleme) ya da X ekseni etrafında 180°
-function upperPrintMap(d) {
-  return d.faceDown ? (x, y, z) => [x, y, z - d.zMin] : (x, y, z) => [x, P.baseL - y, d.zMax - z];
+  return textData;
 }
 
-// Ek parçalar (dişi seçeneklerin içine basılacak parçalar)
-function buildInserts(G, lower, upper, AX) {
-  const list = [];
-  const spec = upper.spec;
-  const T = P.upperT;
-  if (P.lowerType === 'hole') {
-    const len = lower.lhd - 0.3 + P.pressPinL;
-    list.push({ key: 'presspin', label: 'Pres pimi', file: 'ek_pres_pimi.stl', res: pinPart(P.pressPinD / 2, len, 0.6, 0.6, 96),
-      mount: 'lower', at: [AX.x, AX.y, -P.pressPinL] });
-  }
-  if (P.guideType === 'steel') {
-    const d = lower_pinDepth;
-    const res = pinPart(P.guideD / 2, d + P.guideH, Math.min(P.pinChamfer, P.guideD * 0.4), 0.3);
-    G.pins.forEach((p, i) => list.push({ key: 'guide' + i, label: 'Kılavuz pimi ' + (i + 1), file: `ek_kilavuz_pimi_${i + 1}.stl`, res,
-      mount: 'lower', at: [p.x, p.y, lower.zTop - d] }));
-  }
-  if (P.upperType === 'thread' && upper.thd > 0.5) {
-    const sl = upper.thd - 0.5 + P.studLen;
-    list.push({ key: 'stud', label: 'Saplama ' + P.threadSize, file: `ek_saplama_${P.threadSize}.stl`,
-      res: stack({ profiles: [thread(0, 0, 'ext', spec, P.threadClear, 0, sl, { top: true, bot: true, cham: Math.min(0.8, spec.p) })] }),
-      mount: 'upper', at: [AX.x, AX.y, T - upper.thd + 0.5] });
-  }
-  if (P.upperType === 'nut') {
-    const h = upper.nd - 0.3;
-    list.push({ key: 'nut', label: 'Somun ' + P.threadSize, file: `ek_somun_${P.threadSize}.stl`,
-      res: stack({ solids: [{ z0: 0, z1: U(h), paths: [hexagon(0, 0, spec.af)] }], profiles: [thread(0, 0, 'int', spec, P.threadClear, 0, h, { top: true, bot: true, cham: 0.4 })] }),
-      mount: 'upper', at: [AX.x, AX.y, T - upper.nd] });
-    const sl = h + P.studLen;
-    list.push({ key: 'stud', label: 'Saplama ' + P.threadSize, file: `ek_saplama_${P.threadSize}.stl`,
-      res: stack({ profiles: [thread(0, 0, 'ext', spec, P.threadClear, 0, sl, { top: true, bot: true, cham: Math.min(0.8, spec.p) })] }),
-      mount: 'upper', at: [AX.x, AX.y, T - upper.nd] });
-  }
-  return list;
+/* ---------- Önizleme → tam kalite zamanlaması ---------- */
+let paramsVer = 0, pending = null, running = false, timer = null;
+let shown = { ver: -1, quality: null };
+const fullWaiters = [];
+const busy = document.getElementById('busy');
+function setBusy(t) { busy.style.display = t ? 'block' : 'none'; if (t) busy.textContent = t; }
+function cancelFull() {
+  // tam kalite hesabı sürerken yeni değişiklik geldi: işçiyi durdur, önizleme hemen başlasın
+  if (!worker || runningQ !== 'full') return;
+  worker.terminate(); worker = null; sentLogoVer = sentTextVer = null;
+  for (const [id, w] of waiters) { waiters.delete(id); w({ id, ok: false, cancelled: true }); }
+  startWorker();
 }
-
-function buildCoupon(font) {
-  const W = 56, H = 38, T = 6;
-  const cuts = [];
-  const tols = [0.1, 0.2, 0.3, 0.4, 0.5];
-  const spec = THREADS[P.threadSize] || THREADS.M8;
-  tols.forEach((t, i) => cuts.push({ z0: U(1), z1: U(T), paths: [circle(8 + i * 10, 27, (P.guideD + t) / 2, 48, true)] }));
-  [0.1, 0.2, 0.3].forEach((t, i) => cuts.push({ z0: U(T - Math.min(4.5, spec.af * 0.45)), z1: U(T), paths: [hexagon(10 + i * 18, 10, spec.af + t)] }));
-  if (font) {
-    const lab = [];
-    tols.forEach((t, i) => lab.push(...flatText(font, String(i + 1), 2.4, 0, 1, 'center', 8 + i * 10, 33.6).paths));
-    ['A', 'B', 'C'].forEach((c, i) => lab.push(...flatText(font, c, 2.4, 0, 1, 'center', 10 + i * 18 + (i === 2 ? -9 : 9), 20.5).paths));
-    if (lab.length) cuts.push({ z0: U(T - 0.4), z1: U(T), paths: lab });
-  }
-  const plate = stack({ solids: [{ z0: 0, z1: U(T), paths: [rect(0, 0, W, H)] }], cuts });
-  const pin = pinPart(P.guideD / 2, 10, Math.min(P.pinChamfer, P.guideD * 0.4), 0.3);
-  // tek STL içinde iki ayrı kapalı gövde
-  const pos = new Float32Array(plate.pos.length + pin.pos.length);
-  pos.set(plate.pos);
-  for (let i = 0; i < pin.pos.length; i += 3) { pos[plate.pos.length + i] = pin.pos[i] + W + 8; pos[plate.pos.length + i + 1] = pin.pos[i + 1] + H / 2; pos[plate.pos.length + i + 2] = pin.pos[i + 2]; }
-  const off = plate.pos.length / 3;
-  const idx = new Uint32Array(plate.idx.length + pin.idx.length);
-  idx.set(plate.idx);
-  for (let i = 0; i < pin.idx.length; i++) idx[plate.idx.length + i] = pin.idx[i] + off;
-  return { pos, idx };
+function scheduleRebuild() {
+  paramsVer++;
+  cancelFull();
+  clearTimeout(timer);
+  setBusy('Önizleme…');
+  timer = setTimeout(() => { pending = 'preview'; pump(); }, 120);
+}
+async function pump() {
+  if (running || !pending) return;
+  const q = pending; pending = null; running = true; runningQ = q;
+  const ver = paramsVer;
+  setBusy(q === 'preview' ? 'Önizleme…' : 'Tam kalite hesaplanıyor…');
+  let resp;
+  try {
+    const font = await loadFont();
+    const td = prepTextData(font);
+    resp = await callGeom({ type: 'build', P: { ...P }, quality: q, inp: { textVer: td.ver, backVer: td.ver, fontErr } });
+  } catch (e) { console.error(e); resp = { ok: false, err: e.message }; }
+  running = false; runningQ = null;
+  if (resp.cancelled) { if (!pending) pending = 'preview'; return pump(); }
+  if (resp.retry) { pending = pending || q; return pump(); }
+  if (resp.ok) display(resp.r, q, ver);
+  else document.getElementById('warnings').innerHTML = `<div class="msg err">Hata: ${esc(resp.err)}</div>`;
+  if (!pending && q === 'preview' && ver === paramsVer) pending = 'full';
+  if (q === 'full' && ver === paramsVer) while (fullWaiters.length) fullWaiters.shift()(true);
+  if (pending) pump(); else setBusy(false);
+}
+function ensureFull() {
+  if (shown.quality === 'full' && shown.ver === paramsVer) return Promise.resolve(true);
+  return new Promise(res => { fullWaiters.push(res); if (!running && !pending) { pending = 'full'; pump(); } });
 }
 
 /* =====================================================================
-   7) 3D SAHNE
+   7) 3D SAHNE (yalnızca değişiklik olduğunda çizer)
    ===================================================================== */
 const view = document.getElementById('view');
 const renderer = new THREE.WebGLRenderer({ antialias: true, preserveDrawingBuffer: true });
@@ -1335,6 +1801,9 @@ const camera = new THREE.PerspectiveCamera(40, 1, 0.5, 5000);
 camera.up.set(0, 0, 1);
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true; controls.dampingFactor = 0.12;
+let needRender = true;
+const requestRender = () => { needRender = true; };
+controls.addEventListener('change', requestRender);
 scene.add(new THREE.HemisphereLight(0xdfe8ff, 0x2a2622, 0.9));
 const sun = new THREE.DirectionalLight(0xffffff, 1.6); sun.position.set(-60, -90, 140); scene.add(sun);
 const fillL = new THREE.DirectionalLight(0xffffff, 0.5); fillL.position.set(120, 80, 60); scene.add(fillL);
@@ -1342,9 +1811,9 @@ const grid = new THREE.GridHelper(400, 40, 0x3a4250, 0x262c35); grid.rotation.x 
 const fine = new THREE.GridHelper(400, 400, 0x1b2027, 0x1b2027); fine.rotation.x = Math.PI / 2; fine.position.z = -0.03; scene.add(fine);
 const section = new THREE.Plane(new THREE.Vector3(1, 0, 0), 0);
 
-function makeMats(color, opacity = 1) {
+function makeMats(color) {
   return {
-    mat: new THREE.MeshStandardMaterial({ color, roughness: 0.55, metalness: 0.05, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }),
+    mat: new THREE.MeshStandardMaterial({ color, roughness: 0.55, metalness: 0.05, flatShading: true, polygonOffset: true, polygonOffsetFactor: 1, polygonOffsetUnits: 1 }),
     back: new THREE.MeshBasicMaterial({ color: 0xe0393f, side: THREE.BackSide }),
     edge: new THREE.LineBasicMaterial({ color: 0x07090c, transparent: true, opacity: 0.5 }),
     wire: new THREE.MeshBasicMaterial({ color: 0xa8d4ff, wireframe: true, transparent: true, opacity: 0.09, depthWrite: false }),
@@ -1359,68 +1828,43 @@ function makePart(mats) {
   group.add(mesh, back, edges, wire);
   return { group, mats, mesh, back, edges, wire, data: null };
 }
-// Eğim kademelerinin ara kenar çizgilerini gizle (görüntü sadeleşir, dosya değişmez)
-function filterStepEdges(eg, zone) {
-  if (!zone) return eg;
-  const a = eg.attributes.position.array, out = [];
-  const eps = 1e-4, inZ = z => z > zone.z0 + eps && z < zone.z1 - eps;
-  const kept = z => zone.keep.some(k => Math.abs(k - z) < eps);
-  for (let i = 0; i < a.length; i += 6) {
-    const z1 = a[i + 2], z2 = a[i + 5];
-    const both = inZ(z1) && inZ(z2);
-    if (both && !(Math.abs(z1 - z2) < eps && kept(z1))) continue;
-    if (inZ(z1) !== inZ(z2) && Math.abs(z1 - z2) < LH() * 1.01 && !kept(z1) && !kept(z2)) continue;
-    for (let k = 0; k < 6; k++) out.push(a[i + k]);
-  }
-  const g = new THREE.BufferGeometry();
-  g.setAttribute('position', new THREE.Float32BufferAttribute(out, 3));
-  eg.dispose();
-  return g;
-}
 function setPartGeometry(part, res) {
   part.data = res;
   const g = new THREE.BufferGeometry();
   g.setAttribute('position', new THREE.BufferAttribute(res.pos, 3));
   g.setIndex(new THREE.BufferAttribute(res.idx, 1));
-  const disp = res.triCount > 40000 ? g.toNonIndexed() : BufferGeometryUtils.toCreasedNormals(g, Math.PI / 7);
-  if (res.triCount > 40000) disp.computeVertexNormals();
+  g.computeBoundingSphere();
   for (const o of [part.mesh, part.edges, part.wire]) o.geometry.dispose();
-  part.mesh.geometry = disp; part.back.geometry = disp;
-  part.edges.geometry = filterStepEdges(new THREE.EdgesGeometry(g, 25), res.zone);
-  part.wire.geometry = g;
+  part.mesh.geometry = g; part.back.geometry = g; part.wire.geometry = g;   // flatShading: normal gerekmez
+  const eg = new THREE.BufferGeometry();
+  eg.setAttribute('position', new THREE.BufferAttribute(res.edges, 3));
+  part.edges.geometry = eg;
 }
 const maleMats = makeMats(0x5b8def), femaleMats = makeMats(0xf0a43a), insMats = makeMats(0xa5adb8);
 const male = makePart(maleMats);
 const female = makePart(femaleMats);
-const overlays = new THREE.Group();   // ince bölge + bilet (alt kalıp koordinatında)
+const overlays = new THREE.Group();
 male.group.add(overlays);
 const insertRow = new THREE.Group();
 scene.add(male.group, female.group, insertRow);
-let insertParts = [];   // {row: part, mounted: part, def}
+let insertParts = [], currentInserts = [], R = null;   // R: son gösterilen sonuç
 
+function disposeObj(o) { o.traverse(c => { if (c.geometry) c.geometry.dispose(); if (c.material && c.material !== insMats.mat) { const m = c.material; if (!Object.values(maleMats).includes(m) && !Object.values(femaleMats).includes(m) && !Object.values(insMats).includes(m)) m.dispose(); } }); }
 function clearInserts() {
-  for (const ip of insertParts) {
-    for (const p of [ip.row, ip.mounted]) { p.group.parent && p.group.parent.remove(p.group); p.mesh.geometry.dispose(); p.edges.geometry.dispose(); p.wire.geometry.dispose(); }
-  }
+  for (const ip of insertParts) for (const p of [ip.row, ip.mounted]) { if (p.group.parent) p.group.parent.remove(p.group); disposeObj(p.group); }
   insertParts = [];
 }
-function shapeMesh(paths, z, color, opacity) {
-  if (!paths.length) return null;
-  const shapes = treeShapes(clipOp(CL.ClipType.ctUnion, paths, null, NZ, true)).map(s => {
-    const sh = new THREE.Shape(s.outer.map(p => new THREE.Vector2(p.X / S, p.Y / S)));
-    sh.holes = s.holes.map(h => new THREE.Path(h.map(p => new THREE.Vector2(p.X / S, p.Y / S))));
-    return sh;
-  });
-  const g = new THREE.ShapeGeometry(shapes);
-  g.translate(0, 0, z);
-  return new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color, transparent: opacity < 1, opacity, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
+function triMesh(tris, color) {
+  if (!tris || !tris.length) return null;
+  const g = new THREE.BufferGeometry();
+  g.setAttribute('position', new THREE.BufferAttribute(tris, 3));
+  return new THREE.Mesh(g, new THREE.MeshBasicMaterial({ color, side: THREE.DoubleSide, depthWrite: false, polygonOffset: true, polygonOffsetFactor: -2, polygonOffsetUnits: -2 }));
 }
 
 let mode = 0, lastMode = -1;
 const openRange = document.getElementById('openRange'), cutRange = document.getElementById('cutRange');
 const wireChk = document.getElementById('wireChk'), thinChk = document.getElementById('thinChk'), ticketChk = document.getElementById('ticketChk'), axisChk = document.getElementById('axisChk');
-let thinMesh = null, ribMesh = null, ticketMesh = null, ticketEdge = null, axisMarks = null, curAxis = null;
-// Pres ekseni (camgöbeği çizgi) ve yük merkezi (macenta) işaretleri — alt kalıp koordinatında
+let thinMesh = null, ribMesh = null, ticketMesh = null, ticketEdge = null, axisMarks = null;
 function makeAxisMarks(AX, zTop) {
   const g = new THREE.Group();
   const lineG = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(AX.x, AX.y, -14), new THREE.Vector3(AX.x, AX.y, zTop + 22)]);
@@ -1429,28 +1873,27 @@ function makeAxisMarks(AX, zTop) {
   g.add(new THREE.Mesh(ringG, new THREE.MeshBasicMaterial({ color: 0x22d3ee, depthTest: false, transparent: true, opacity: 0.85, side: THREE.DoubleSide })));
   const dotG = new THREE.CircleGeometry(0.5, 24); dotG.translate(AX.load.x, AX.load.y, zTop + 0.06);
   g.add(new THREE.Mesh(dotG, new THREE.MeshBasicMaterial({ color: 0xff3fd2, depthTest: false, transparent: true, opacity: 0.85, side: THREE.DoubleSide })));
-  g.renderOrder = 10; g.children.forEach(c => c.renderOrder = 10);
+  g.children.forEach(c => c.renderOrder = 10);
   return g;
 }
 
 function applyMode(resetCam = false) {
-  if (!male.data || !female.data) return;
-  const G = layout();
-  const T = P.upperT;
+  if (!R) return;
+  const W = P.baseW, L = P.baseL;
   const open = parseFloat(openRange.value);
   const assembled = mode !== 0;
-  const zFace = male.data.zTop + P.paperOff + open;
+  const zFace = R.lowerInfo.zTop + P.paperOff + open;
   female.group.rotation.set(0, 0, 0);
   if (assembled) female.group.position.set(0, 0, zFace);
-  else if (female.data.faceDown) female.group.position.set(G.W + 15, 0, -female.data.zMin);
-  else { female.group.rotation.set(Math.PI, 0, 0); female.group.position.set(G.W + 15, G.L, female.data.zMax); }
+  else if (R.upperInfo.faceDown) female.group.position.set(W + 15, 0, -R.upper.zMin);
+  else { female.group.rotation.set(Math.PI, 0, 0); female.group.position.set(W + 15, L, R.upper.zMax); }
 
-  const d = new THREE.Vector2(G.pins[1].x - G.pins[0].x, G.pins[1].y - G.pins[0].y).normalize();
+  const [p0, p1] = R.pins;
+  const d = new THREE.Vector2(p1[0] - p0[0], p1[1] - p0[1]).normalize();
   const n = new THREE.Vector3(-d.y, d.x, 0); if (n.x + n.y < 0) n.negate();
   const off = parseFloat(cutRange.value);
   section.normal.copy(n);
-  const ax = curAxis || { x: G.cx, y: G.cy };
-  section.constant = -(n.x * ax.x + n.y * ax.y) - off;
+  section.constant = -(n.x * R.axis.x + n.y * R.axis.y) - off;
 
   const sect = mode === 2;
   const planes = sect ? [section] : [];
@@ -1460,9 +1903,7 @@ function applyMode(resetCam = false) {
     m.mat.needsUpdate = m.back.needsUpdate = m.edge.needsUpdate = true;
   }
   if (mode === 1) { femaleMats.mat.transparent = true; femaleMats.mat.opacity = 0.38; femaleMats.mat.depthWrite = false; femaleMats.edge.opacity = 0.3; }
-  for (const part of [male, female, ...insertParts.flatMap(i => [i.row, i.mounted])]) {
-    part.back.visible = sect; part.wire.visible = sect && wireChk.checked;
-  }
+  for (const part of [male, female, ...insertParts.flatMap(i => [i.row, i.mounted])]) { part.back.visible = sect; part.wire.visible = sect && wireChk.checked; }
   for (const ip of insertParts) { ip.row.group.visible = !assembled; ip.mounted.group.visible = assembled; }
   if (axisMarks) axisMarks.visible = axisChk.checked;
   if (thinMesh) thinMesh.visible = thinChk.checked;
@@ -1476,19 +1917,21 @@ function applyMode(resetCam = false) {
   document.getElementById('optHint').textContent = mode === 0
     ? 'Parçalar baskı tablasındaki yönleriyle. Gri parçalar ek (ayrı basılan) parçalardır.'
     : sect ? 'Kesit pres ekseninden, kılavuz pimlerine paralel geçer (kaydırarak pimleri görün). Kırmızı = kesilen iç malzeme.'
-    : 'Üst kalıp yarı saydam: pimler deliklere, kabartma oyuğa oturmalı. Bilet L-köşeye yaslı.';
-  const lim = Math.round(Math.max(G.W, G.L) / 2);
+    : 'Üst kalıp yarı saydam: pimler deliklere, kabartma oyuğa oturmalı. Bilet dayamaya yaslı.';
+  const lim = Math.round(Math.max(W, L) / 2);
   cutRange.min = -lim; cutRange.max = lim;
   document.getElementById('openVal').textContent = open.toFixed(1) + ' mm';
   document.getElementById('cutVal').textContent = off.toFixed(1) + ' mm';
   if (resetCam || lastMode !== mode) fitCamera();
   lastMode = mode;
+  requestRender();
 }
 function fitCamera() {
   const box = new THREE.Box3();
   scene.updateMatrixWorld(true);
   box.expandByObject(male.mesh); box.expandByObject(female.mesh);
   if (mode === 0) for (const ip of insertParts) box.expandByObject(ip.row.mesh);
+  if (box.isEmpty()) return;
   const c = box.getCenter(new THREE.Vector3());
   const size = box.getSize(new THREE.Vector3()).length();
   const dir = mode === 0 ? new THREE.Vector3(-0.15, -1, 0.9) : mode === 1 ? new THREE.Vector3(0.75, -1, 0.75)
@@ -1499,162 +1942,106 @@ function fitCamera() {
   camera.position.copy(c).addScaledVector(dir, dist);
   camera.near = dist / 100; camera.far = dist * 20; camera.updateProjectionMatrix();
   controls.update();
+  requestRender();
 }
 function resize() {
   const w = view.clientWidth, h = view.clientHeight;
   renderer.setSize(w, h, false);
   camera.aspect = w / Math.max(h, 1); camera.updateProjectionMatrix();
+  requestRender();
 }
 new ResizeObserver(resize).observe(view);
 resize();
-renderer.setAnimationLoop(() => { controls.update(); renderer.render(scene, camera); });
+renderer.setAnimationLoop(() => {
+  const moved = controls.update();
+  if (moved || needRender) { needRender = false; renderer.render(scene, camera); }
+});
 
 /* =====================================================================
-   8) YENİDEN OLUŞTURMA + KONTROLLER
+   8) SONUCU GÖSTER
    ===================================================================== */
-let timer = null, buildId = 0, firstBuild = true, lastComp = { w: 0, h: 0 }, curFont = null, fontErr = null;
-const busy = document.getElementById('busy');
-function scheduleRebuild() { clearTimeout(timer); busy.style.display = 'block'; timer = setTimeout(rebuild, 150); }
+let firstBuild = true, lastComp = { w: 0, h: 0, bx: [0, 0, 0, 0] };
+function display(r, quality, ver) {
+  R = r; shown = { ver, quality };
+  lastComp = r.comp;
+  setPartGeometry(male, r.lower);
+  setPartGeometry(female, r.upper);
 
-async function rebuild() {
-  const id = ++buildId;
-  busy.style.display = 'block';
-  fontErr = null;
-  try { curFont = await getFont(P.font); } catch (e) { curFont = null; fontErr = e; }
-  if (id !== buildId) return;
-  await new Promise(r => setTimeout(r, 0));
-  if (id !== buildId) return;
-  const warn = [];
-  const W_ = (k, t) => warn.push([k, t]);
-  try {
-    const G = layout();
-    if (G.F < G.holeD + 2.5) throw new Error(`Pim flanşı en az ${(G.holeD + 2.5).toFixed(1)} mm olmalı.`);
-    const TM = {}; let _t = performance.now(); const tick = k => { const n = performance.now(); TM[k] = Math.round(n - _t); _t = n; };
-    const comp = composeDesign(curFont, G); tick('compose');
-    lastComp = comp;
-    const design = comp.all;
-    const AX = computeAxis(comp, G); curAxis = AX;
-    const lower = buildLower(comp, G, curFont, AX); tick('lower');
-    const upper = buildUpper(comp, G, curFont, AX); tick('upper');
-    const inserts = buildInserts(G, lower, upper, AX); tick('inserts');
-    setPartGeometry(male, lower);
-    setPartGeometry(female, upper); tick('display');
+  clearInserts();
+  let rx = 0;
+  for (const def of r.inserts) {
+    const row = makePart(insMats), mounted = makePart(insMats);
+    setPartGeometry(row, def.res); setPartGeometry(mounted, { ...def.res });
+    const bb = new THREE.Box3().setFromBufferAttribute(row.mesh.geometry.attributes.position);
+    row.group.position.set(rx - bb.min.x, -14 - bb.max.y, 0);
+    rx += bb.max.x - bb.min.x + 6;
+    mounted.group.position.set(...def.at);
+    insertRow.add(row.group);
+    (def.mount === 'lower' ? male.group : female.group).add(mounted.group);
+    insertParts.push({ def, row, mounted });
+  }
+  currentInserts = r.inserts;
 
-    // Ek parçalar
-    clearInserts();
-    let rx = 0;
-    for (const def of inserts) {
-      const row = makePart(insMats), mounted = makePart(insMats);
-      setPartGeometry(row, def.res); setPartGeometry(mounted, def.res);
-      const bb = new THREE.Box3().setFromBufferAttribute(row.mesh.geometry.attributes.position);
-      row.group.position.set(rx - bb.min.x, -14 - bb.max.y, 0);
-      rx += bb.max.x - bb.min.x + 6;
-      mounted.group.position.set(...def.at);
-      insertRow.add(row.group);
-      (def.mount === 'lower' ? male.group : female.group).add(mounted.group);
-      insertParts.push({ def, row, mounted });
-    }
-
-    // İnce bölge katmanları, bilet, eksen işaretleri
-    for (const m of [thinMesh, ribMesh, ticketMesh, ticketEdge]) if (m) { overlays.remove(m); m.geometry.dispose(); m.material.dispose(); }
-    if (axisMarks) { overlays.remove(axisMarks); axisMarks.traverse(o => { if (o.geometry) o.geometry.dispose(); if (o.material) o.material.dispose(); }); }
-    thinMesh = ribMesh = ticketMesh = ticketEdge = null;
-    const H = effH(), cd = effCD();
-    const thin = thinParts(design, P.minLine);
-    // Dişi tarafta kalan duvar = tasarım boşluğu − 2 × (kağıt payı + ağız ofseti)
-    const work = [rect(G.ox + P.wallGap, G.oy + P.wallGap, G.W, G.L)];
-    const gaps = design.length ? difference(work, comp.cores.length ? region(design.concat(comp.cores)) : design) : [];   // tarama araları kasıtlı, sayılmaz
-    const expand = Math.max(0, P.paperOff + H * tanD() / 2 - Math.min(P.paperOff, H) * tanD());
-    const thinRibs = gaps.length ? thinParts(gaps, P.minRib + 2 * expand, 0.25) : [];
-    const emb = P.relief === 'emboss';
-    thinMesh = shapeMesh(thin, lower.zTop + (emb ? H : 0) + 0.03, 0xff2b2b, 0.95);
-    ribMesh = shapeMesh(thinRibs, lower.zTop + 0.03, 0xff9a1f, 0.95);
+  // katmanlar: ince bölgeler (yalnız tam kalitede), bilet, eksen
+  for (const o of [ticketMesh, ticketEdge, axisMarks]) if (o) { overlays.remove(o); disposeObj(o); }
+  if (quality === 'full' || (thinMesh && shown.ver !== ver)) {
+    for (const o of [thinMesh, ribMesh]) if (o) { overlays.remove(o); disposeObj(o); }
+    thinMesh = ribMesh = null;
+  }
+  if (quality === 'full') {
+    thinMesh = triMesh(r.thinTris, 0xff2b2b);
+    ribMesh = triMesh(r.ribTris, 0xff9a1f);
     if (thinMesh) overlays.add(thinMesh);
     if (ribMesh) overlays.add(ribMesh);
-    const tg = new THREE.BoxGeometry(P.ticketW, P.ticketH, Math.max(P.paperOff, 0.05));
-    tg.translate(G.ox + P.ticketW / 2, G.oy + P.ticketH / 2, lower.zTop + Math.max(P.paperOff, 0.05) / 2);
-    ticketMesh = new THREE.Mesh(tg, new THREE.MeshStandardMaterial({ color: 0xf6f1e4, transparent: true, opacity: 0.35, depthWrite: false, roughness: 0.9 }));
-    ticketEdge = new THREE.LineSegments(new THREE.EdgesGeometry(tg), new THREE.LineBasicMaterial({ color: 0xf6f1e4, transparent: true, opacity: 0.55 }));
-    overlays.add(ticketMesh, ticketEdge);
-    axisMarks = makeAxisMarks(AX, lower.zTop);
-    overlays.add(axisMarks);
-    tick('overlays'); window.__timings = TM;
-
-    // ---- Kontroller ----
-    const thinA = areaMM2(thin), ribA = areaMM2(thinRibs);
-    const cavFace = emb ? upper.cavFace : lower.cavFace;
-    if (fontErr && P.textMode !== 'none') W_('err', 'Font yüklenemedi: ' + fontErr.message + '. İnternet bağlantısını kontrol edin.');
-    if (!design.length) W_('warn', 'Tasarım boş (logo veya yazı ekleyin).');
-    const wallZone = offsetPaths([wallPoly(G)], U(0.3));
-    if (interArea(design, wallZone) > 0.0005) W_('err', 'Desen L-dayama duvarına değiyor/çakışıyor. Tasarım merkezini duvardan uzaklaştırın.');
-    const safe = [rect(G.ox + P.wallGap + 0.8, G.oy + P.wallGap + 0.8, G.W - 1.2, G.L - 1.2)];
-    if (diffArea(cavFace, safe) > 0.001) W_('err', 'Oyuk kalıp kenarına veya duvar kanalına çok yakın/taşıyor. Tasarımı küçültün veya "Tasarımı ortala"ya basın.');
-    if (thinA > 0.3) W_('warn', `İnce çizgi: toplam <b>${thinA.toFixed(2)} mm²</b> bölge ${P.minLine} mm'den ince (kırmızı). Bu kısımlar kağıtta zayıf çıkar: harf yüksekliğini veya çizgi kalınlığını artırın.`);
-    if (ribA > 2.0) W_('warn', `Dar boşluk: toplam <b>${ribA.toFixed(2)} mm²</b> bölgede tasarım boşluğu ${(P.minRib + 2 * expand).toFixed(2)} mm'den dar (turuncu). Bu boşluklar kapanır; harf içleri kaybolabilir: harf aralığını/boyunu artırın.`);
-    if (comp.bigRaw > 0.5) W_('warn', `Büyük dolu alan: ${comp.bigRaw.toFixed(1)} mm² bölgeye Ø${P.bigD} mm daire sığıyor. Geniş dolu kabartma kartonu gerer ve buruşturur; "Kontur" veya "Kontur + tarama" seçin.`);
-    if (comp.filled > 0) W_('info', `${comp.filled.toFixed(1)} mm² büyük alan ${P.fillMode === 'hatch' ? 'kontur + taramaya' : 'kontura'} çevrildi.`);
-    // Pres ekseni
-    if (!AX.inside) W_('err', `Pres ekseni (${AX.x}, ${AX.y}) izin verilen bölgenin dışında: bağlantı kanal/kenar/pim deliklerine çok yakın. İzinli: X ${AX.box.x0.toFixed(1)}–${AX.box.x1.toFixed(1)}, Y ${AX.box.y0.toFixed(1)}–${AX.box.y1.toFixed(1)} mm.`);
-    if (design.length && AX.offset > 3) W_('warn', `Yük merkezi pres ekseninden <b>${AX.offset.toFixed(1)} mm</b> kaçık: kalıp bastırırken yatabilir, kabartma bir tarafta sığ çıkar.${P.axisMode !== 'auto' ? ' "Otomatik" eksen modunu deneyin.' : ' Eksen izinli bölgenin sınırında; tasarımı merkeze yaklaştırın.'}`);
-    else if (design.length && AX.offset > 1) W_('info', `Yük merkezi eksenden ${AX.offset.toFixed(1)} mm kaçık (kabul edilebilir).`);
-    // Et kalınlıkları
-    if (emb && P.upperType === 'nut') {
-      const floor = P.upperT - upper.nd - cd;
-      if (interArea(upper.cavFace, upper.hex) > 0.001 && floor < 1.0)
-        W_('warn', `Oyuk ile somun yuvası arasında yalnızca <b>${floor.toFixed(2)} mm</b> et kalıyor. Üst plakayı <b>${(upper.nd + cd + 1).toFixed(1)} mm</b> yapın.`);
-    }
-    if (!emb && P.lowerType === 'hole') {
-      const floor = P.lowerT - lower.lhd - cd;
-      if (interArea(lower.cavFace, [circle(AX.x, AX.y, P.lowerHoleD / 2, 64)]) > 0.001 && floor < 1.0)
-        W_('warn', `Alt oyuk ile pres deliği arasında yalnızca <b>${floor.toFixed(2)} mm</b> et kalıyor. Alt plakayı kalınlaştırın veya delik derinliğini azaltın.`);
-    }
-    for (const t of [...lower.warns, ...upper.warns]) W_('warn', t);
-    if (!emb && P.upperType === 'stud') W_('warn', 'Ters kabartma + entegre cıvata: üst kalıp desen yukarı basılır, cıvata alta gelir ve <b>destek gerekir</b>. Desteksiz baskı için "Somun yuvası" veya "Dişli delik" seçin.');
-    if (P.lowerType === 'pin') W_('info', 'Entegre pres pimi seçili: plaka pimin üstünde havada kalır, <b>destek gerekir</b>. Desteksiz baskı için "Dişi delik + ayrı pim" seçin.');
-    if (cd < H + P.paperOff * 0.5) W_('warn', 'Oyuk sığ: oyuk derinliği ≈ kabartma + kağıt kalınlığı olmalı.');
-    if (P.guideH < P.wallH + 1) W_('warn', 'Kılavuz pimi kısa; kabartma kağıda değmeden önce deliğe girmeli.');
-    if (Math.abs(H - P.embossH) > 0.005 || Math.abs(cd - P.cavityD) > 0.005) W_('info', `Katman yüksekliğine (${LH()} mm) yuvarlandı: kabartma <b>${H.toFixed(2)}</b>, oyuk <b>${cd.toFixed(2)} mm</b>.`);
-    const badT = lower.badEdges + upper.badEdges;
-    if (badT || inserts.some(i => i.res.badEdges))
-      W_('warn', `Ağ kontrolü: ${badT} kenarda şekiller birbirine tam teğet değiyor (genellikle harf/çerçeve teması). Dilimleyiciler bunu otomatik onarır; tamamen temiz dosya için harf aralığını veya yarıçapı 0.1 mm değiştirin.`);
-    if (!warn.some(w => w[0] === 'warn' || w[0] === 'err')) warn.unshift(['ok', 'Tüm kontroller başarılı. Kalıplar baskıya hazır.']);
-
-    const lv = lower.levels.length > 1 ? ` · Seviyeler: ${lower.levels.map(l => Math.round(l.frac * 100) + '% (' + l.Ht.toFixed(2) + ')').join(', ')}` : '';
-    document.getElementById('info').innerHTML = `
-      Tasarım: <b>${comp.w.toFixed(1)} × ${comp.h.toFixed(1)} mm</b> · Çalışma alanı: <b>${(G.W - G.ox).toFixed(1)} × ${(G.L - G.oy).toFixed(1)} mm</b><br>
-      ${emb ? 'Kabartma' : 'Ters kabartma'}: <b>${H.toFixed(2)} mm</b>, oyuk <b>${cd.toFixed(2)} mm</b>${lv}<br>
-      Pres ekseni: <b>X ${AX.x.toFixed(1)}, Y ${AX.y.toFixed(1)}</b> · yük kaçıklığı <b>${AX.offset.toFixed(1)} mm</b><br>
-      Alt kalıp: <b>${G.W} × ${G.L} × ${lower.height.toFixed(1)} mm</b> · Üst kalıp: <b>${G.W} × ${G.L} × ${upper.height.toFixed(1)} mm</b><br>
-      Üst pim deliği Ø<b>${G.holeD.toFixed(2)}</b> × <b>${P.upperHoleMode === 'through' ? 'boydan boya' : upper.hd.toFixed(1)}</b> · Duvar kanalı <b>${(P.wallT + 2 * P.wallGap).toFixed(1)} × ${upper.gd.toFixed(2)} mm</b>`;
-    const st = (r, name, col) => `<div class="part"><span class="dot" style="background:${col}"></span>${name}:
-      <span class="${r.badEdges ? 'bad' : 'good'}">${r.badEdges ? '⚠ ' + r.badEdges + ' teğet kenar' : '✓ su geçirmez'}</span> · ${r.triCount.toLocaleString('tr-TR')} üçgen</div>`;
-    document.getElementById('status').innerHTML = st(lower, `Alt Kalıp (${emb ? 'Erkek' : 'Dişi'})`, '#5b8def') + st(upper, `Üst Kalıp (${emb ? 'Dişi' : 'Erkek'})`, '#f0a43a') +
-      (inserts.length ? `<div class="part"><span class="dot" style="background:#a5adb8"></span>Ek parçalar: ${[...new Set(inserts.map(i => i.label))].join(', ')} <span class="${inserts.some(i => i.res.badEdges) ? 'bad' : 'good'}">${inserts.some(i => i.res.badEdges) ? '⚠' : '✓'}</span></div>` : '');
-    document.getElementById('insertBtns').innerHTML = inserts.map((d, i) => `<button class="primary dl-ins" data-ins="${i}">${esc(d.label)} .STL</button>`).join('');
-    document.querySelectorAll('[data-ins]').forEach(b => b.addEventListener('click', () => { const d = inserts[+b.dataset.ins]; downloadFile(stlBytes(d.res.pos, d.res.idx), d.file); }));
-    currentInserts = inserts;
-    renderPrintCard(lower, upper, inserts);
-    applyMode(firstBuild);
-    firstBuild = false;
-  } catch (e) {
-    console.error(e);
-    W_('err', 'Hata: ' + (e && e.message ? e.message : e));
+  } else {
+    for (const o of [thinMesh, ribMesh]) if (o) { overlays.remove(o); disposeObj(o); }
+    thinMesh = ribMesh = null;
   }
-  busy.style.display = 'none';
-  document.getElementById('warnings').innerHTML = warn.map(([k, t]) => `<div class="msg ${k}">${t}</div>`).join('');
-}
-let currentInserts = [];
+  const t = r.ticket, zT = r.lowerInfo.zTop, th = Math.max(P.paperOff, 0.05);
+  const tg = new THREE.BoxGeometry(t.x1 - t.x0, t.y1 - t.y0, th);
+  tg.translate((t.x0 + t.x1) / 2, (t.y0 + t.y1) / 2, zT + th / 2);
+  ticketMesh = new THREE.Mesh(tg, new THREE.MeshStandardMaterial({ color: 0xf6f1e4, transparent: true, opacity: 0.35, depthWrite: false, roughness: 0.9 }));
+  ticketEdge = new THREE.LineSegments(new THREE.EdgesGeometry(tg), new THREE.LineBasicMaterial({ color: 0xf6f1e4, transparent: true, opacity: 0.55 }));
+  axisMarks = makeAxisMarks(r.axis, zT);
+  overlays.add(ticketMesh, ticketEdge, axisMarks);
 
-function renderPrintCard(lower, upper, inserts) {
-  const emb = P.relief === 'emboss', faceDown = upper.faceDown, lh = LH();
-  const H = effH(), cd = effCD();
+  const emb = P.relief === 'emboss', H = r.effH, cd = r.effCD;
+  const lv = r.lowerInfo.levels.length > 1 ? ` · Seviyeler: ${r.lowerInfo.levels.map(l => Math.round(l.frac * 100) + '% (' + l.Ht.toFixed(2) + ')').join(', ')}` : '';
+  document.getElementById('info').innerHTML = `
+    Tasarım: <b>${r.comp.w.toFixed(1)} × ${r.comp.h.toFixed(1)} mm</b><br>
+    ${emb ? 'Kabartma' : 'Ters kabartma'}: <b>${H.toFixed(2)} mm</b>, oyuk <b>${cd.toFixed(2)} mm</b>${lv}<br>
+    Pres ekseni: <b>X ${r.axis.x.toFixed(1)}, Y ${r.axis.y.toFixed(1)}</b> · yük kaçıklığı <b>${r.axis.offset.toFixed(1)} mm</b><br>
+    Alt kalıp: <b>${P.baseW} × ${P.baseL} × ${r.lowerInfo.height.toFixed(1)} mm</b> · Üst kalıp: <b>${P.baseW} × ${P.baseL} × ${r.upperInfo.height.toFixed(1)} mm</b><br>
+    Üst pim deliği Ø<b>${(P.guideD + P.pinTol).toFixed(2)}</b> × <b>${P.upperHoleMode === 'through' ? 'boydan boya' : r.upperInfo.hd.toFixed(1)}</b> · Duvar kanalı <b>${(P.wallT + 2 * P.wallGap).toFixed(1)} × ${r.upperInfo.gd.toFixed(2)} mm</b>`;
+  const prev = quality === 'preview';
+  const st = (x, name, col) => `<div class="part"><span class="dot" style="background:${col}"></span>${name}:
+    ${prev ? '<span style="color:var(--muted)">önizleme</span>' : `<span class="${x.badEdges ? 'bad' : 'good'}">${x.badEdges ? '⚠ ' + x.badEdges + ' teğet kenar' : '✓ su geçirmez'}</span>`} · ${x.triCount.toLocaleString('tr-TR')} üçgen</div>`;
+  document.getElementById('status').innerHTML = st(r.lower, `Alt Kalıp (${emb ? 'Erkek' : 'Dişi'})`, '#5b8def') + st(r.upper, `Üst Kalıp (${emb ? 'Dişi' : 'Erkek'})`, '#f0a43a') +
+    (r.inserts.length ? `<div class="part"><span class="dot" style="background:#a5adb8"></span>Ek parçalar: ${[...new Set(r.inserts.map(i => i.label))].join(', ')}</div>` : '');
+  document.getElementById('insertBtns').innerHTML = r.inserts.map((d, i) => `<button class="primary dl-ins" data-ins="${i}">${esc(d.label)} .STL</button>`).join('');
+  document.querySelectorAll('[data-ins]').forEach(b => b.addEventListener('click', async () => {
+    await withFull(async () => { const d = currentInserts[+b.dataset.ins]; if (d) downloadFile(stlBytes(d.res.pos, d.res.idx), d.file); });
+  }));
+  if (!prev) {
+    document.getElementById('warnings').innerHTML = r.warnings.map(([k, t]) => `<div class="msg ${k}">${t}</div>`).join('');
+    renderPrintCard(r);
+  }
+  applyMode(firstBuild);
+  firstBuild = false;
+  if (window.__onBuilt) window.__onBuilt(quality);
+}
+
+function upperPrintMap(r) {
+  return r.upperInfo.faceDown ? (x, y, z) => [x, y, z - r.upper.zMin] : (x, y, z) => [x, P.baseL - y, r.upper.zMax - z];
+}
+function renderPrintCard(r) {
+  const emb = P.relief === 'emboss', faceDown = r.upperInfo.faceDown, lh = r.LH;
+  const H = r.effH, cd = r.effCD, zTop = r.lowerInfo.zTop;
   const tags = a => a.map(x => `<span class="tag">${x}</span>`).join('');
   const f2 = v => (Math.max(0, v)).toFixed(2);
-  // İnce katman aralıkları (baskı yönündeki Z)
-  const lowRange = emb ? [lower.zTop - 0.2, lower.zTop + Math.max(H, P.guideType === 'printed' ? P.guideH : 0)] : [lower.zTop - cd - 0.2, lower.zTop + P.guideH];
-  const map = upperPrintMap(upper);
-  const zs = emb ? [0, cd + 0.2] : [-H, 0.2];
-  const up = zs.map(z => map(0, 0, z)[2]).sort((a, b) => a - b);
+  const lowRange = emb ? [zTop - 0.2, zTop + Math.max(H, P.guideType === 'printed' ? P.guideH : 0)] : [zTop - cd - 0.2, zTop + P.guideH];
+  const map = upperPrintMap(r);
+  const up = (emb ? [0, cd + 0.2] : [-H, 0.2]).map(z => map(0, 0, z)[2]).sort((a, b) => a - b);
   let h = `<h4>Genel ayarlar</h4>${tags(['PLA+ / PETG', 'Nozul 0.4 (detay için 0.2)', `İnce katman ${lh} mm`, 'Gövde 0.2 mm', '4–5 duvar', 'Üst/Alt 6 katman', 'Dolgu %80–100 gyroid', 'Arachne duvar'])}
     <ul><li><b>Yükseklik aralığına göre katman</b> (Bambu Studio / OrcaSlicer: nesneye sağ tık → <i>Yükseklik aralığı ekle</i>; Cura: <i>Adaptive layers</i>):<br>
       Alt kalıp <b>${f2(lowRange[0])}–${f2(lowRange[1])} mm</b> arası ${lh} mm · Üst kalıp <b>${f2(up[0])}–${f2(up[1])} mm</b> arası ${lh} mm${P.upperType === 'stud' ? ` · cıvata bölgesi (${f2(map(0, 0, P.upperT)[2])}–${f2(map(0, 0, P.upperT + P.studLen)[2])} mm) ${lh}–0.12 mm` : ''}. Geri kalanı 0.2 mm.</li>
@@ -1671,16 +2058,16 @@ function renderPrintCard(lower, upper, inserts) {
       : `<li>Yön: <b>${emb ? 'oyuk' : 'desen'} yukarı</b>, arka yüz tablada${!emb && P.upperType === 'stud' ? ' — cıvata alta gelir, <b>destek gerekir</b>' : ' — desteksiz'}.</li>
          ${emb ? '' : '<li><b>Ütüleme</b> açın: desen tepeleri pürüzsüz olur.</li>'}`}
     </ul>`;
-  if (inserts.length) {
-    h += `<h4>Ek parçalar</h4><ul>${inserts.map(i => `<li><b>${esc(i.label)}</b>: dik basın${/pim/i.test(i.label) ? ', 3 mm brim' : ''}${/Saplama/.test(i.label) ? `, %100 dolgu, ${lh}–0.12 mm katman` : ''}${/Somun/.test(i.label) ? ', düz yatırarak, %100 dolgu' : ''}.</li>`).join('')}
+  if (r.inserts.length) {
+    h += `<h4>Ek parçalar</h4><ul>${r.inserts.map(i => `<li><b>${esc(i.label)}</b>: dik basın${/pim/i.test(i.label) ? ', 3 mm brim' : ''}${/Saplama/.test(i.label) ? `, %100 dolgu, ${lh}–0.12 mm katman` : ''}${/Somun/.test(i.label) ? ', düz yatırarak, %100 dolgu' : ''}.</li>`).join('')}
       ${P.guideType === 'steel' ? `<li>Çelik pim (Ø${P.guideD} DIN 6325) basılı pim yerine kullanılabilir${P.lowerHoleMode === 'through' ? '; boydan boya delikten alttan itilerek çıkarılır' : ''}.</li>` : ''}</ul>`;
   }
-  if (P.backOn) h += `<div class="hint">Kalıp arkalarına ${snap(P.backDepth).toFixed(2)} mm derinlikte "ALT"/"ÜST" kazınır; tablaya bakan yüzde olsa bile baskıyı zorlamaz.</div>`;
+  if (P.backOn) h += `<div class="hint">Kalıp arkalarına sığ "ALT"/"ÜST" yazısı kazınır; tablaya bakan yüzde olsa bile baskıyı zorlamaz.</div>`;
   document.getElementById('printCard').innerHTML = h;
 }
 
 /* =====================================================================
-   9) DIŞA AKTARMA
+   9) DIŞA AKTARMA (her zaman tam kalite)
    ===================================================================== */
 const exporter = new STLExporter();
 function stlBytes(pos, idx) {
@@ -1692,7 +2079,7 @@ function stlBytes(pos, idx) {
   return new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
 }
 function upperPrintPos() {
-  const d = female.data, f = upperPrintMap(d);
+  const d = R.upper, f = upperPrintMap(R);
   const out = new Float32Array(d.pos.length);
   for (let i = 0; i < d.pos.length; i += 3) { const v = f(d.pos[i], d.pos[i + 1], d.pos[i + 2]); out[i] = v[0]; out[i + 1] = v[1]; out[i + 2] = v[2]; }
   return out;   // öteleme veya X ekseni etrafında 180° döndürme (ayna değil)
@@ -1704,32 +2091,41 @@ function downloadFile(bytes, name, type = 'model/stl') {
   document.body.appendChild(a); a.click(); a.remove();
   setTimeout(() => URL.revokeObjectURL(a.href), 3000);
 }
+async function withFull(fn) {
+  clearTimeout(timer);
+  if (shown.quality !== 'full' || shown.ver !== paramsVer) { setBusy('Tam kalite hesaplanıyor…'); await ensureFull(); }
+  return fn();
+}
 const lowerName = () => P.relief === 'emboss' ? 'alt_kalip_erkek.stl' : 'alt_kalip_disi.stl';
 const upperName = () => P.relief === 'emboss' ? 'ust_kalip_disi.stl' : 'ust_kalip_erkek.stl';
 function partFiles() {
-  const files = {
-    [lowerName()]: stlBytes(male.data.pos, male.data.idx),
-    [upperName()]: stlBytes(upperPrintPos(), female.data.idx),
-  };
+  const files = { [lowerName()]: stlBytes(R.lower.pos, R.lower.idx), [upperName()]: stlBytes(upperPrintPos(), R.upper.idx) };
   const seen = new Set();
   for (const d of currentInserts) { if (seen.has(d.file)) continue; seen.add(d.file); files[d.file] = stlBytes(d.res.pos, d.res.idx); }
   return files;
 }
-document.querySelectorAll('[data-dl]').forEach(b => b.addEventListener('click', () => {
-  if (!male.data) return;
-  if (b.dataset.dl === 'male') downloadFile(stlBytes(male.data.pos, male.data.idx), lowerName());
-  else downloadFile(stlBytes(upperPrintPos(), female.data.idx), upperName());
-}));
-function downloadZip() {
-  if (!male.data) return;
+document.querySelectorAll('[data-dl]').forEach(b => b.addEventListener('click', () => withFull(() => {
+  if (b.dataset.dl === 'male') downloadFile(stlBytes(R.lower.pos, R.lower.idx), lowerName());
+  else downloadFile(stlBytes(upperPrintPos(), R.upper.idx), upperName());
+})));
+const downloadZip = () => withFull(() => {
   const files = partFiles();
   files['ayarlar.json'] = new TextEncoder().encode(JSON.stringify(P, null, 2));
   downloadFile(zipSync(files, { level: 6 }), 'soguk_damga_kaliplari.zip', 'application/zip');
-}
+});
 document.getElementById('zipBtn').addEventListener('click', downloadZip);
 document.getElementById('zipBtn2').addEventListener('click', downloadZip);
-document.getElementById('couponBtn').addEventListener('click', () => {
-  const c = buildCoupon(curFont);
+async function couponData() {
+  const font = await loadFont();
+  const labels = [];
+  if (font) {
+    [0, 1, 2, 3, 4].forEach(i => labels.push(...flatText(font, String(i + 1), 2.4, 0, 1, 'center', 8 + i * 10, 33.6).paths));
+    ['A', 'B', 'C'].forEach((c, i) => labels.push(...flatText(font, c, 2.4, 0, 1, 'center', 10 + i * 18 + (i === 2 ? -9 : 9), 20.5).paths));
+  }
+  return GEOM.handle({ type: 'coupon', P: { ...P }, labels });
+}
+document.getElementById('couponBtn').addEventListener('click', async () => {
+  const c = await couponData();
   downloadFile(stlBytes(c.pos, c.idx), 'tolerans_test_parcasi.stl');
 });
 
@@ -1741,7 +2137,7 @@ buildPanel();
 
 function loadSVGText(text, name, isCustom) {
   try {
-    rawLogo = parseSVG(text);
+    rawLogo = parseSVG(text); logoVer++;
     document.getElementById('fileName').textContent = 'Yüklü: ' + name;
     if (isCustom) { customSVG = text; customSVGName = name; } else { customSVG = null; customSVGName = ''; }
     save();
@@ -1759,17 +2155,30 @@ document.getElementById('svgFile').addEventListener('change', e => {
 });
 document.getElementById('sampleBtn').addEventListener('click', () => { document.getElementById('svgFile').value = ''; loadSVGText(SAMPLE_SVG, 'örnek logo', false); });
 document.getElementById('centerBtn').addEventListener('click', () => {
-  const G = layout();
+  // çalışma alanı (dünya yönünde) ortası; tasarım kutusunun merkezi oraya gelsin
   const bx = lastComp.bx || [0, 0, 0, 0];
-  P.designX = +((G.W - G.ox) / 2 - (bx[0] + bx[2]) / 2).toFixed(2);
-  P.designY = +((G.L - G.oy) / 2 - (bx[1] + bx[3]) / 2).toFixed(2);
+  const edge = P.stopType === 'edge', F = P.flangeW, t = P.wallT;
+  const W = P.baseW, L = P.baseL;
+  if (edge) {
+    const along = ['left', 'right'].includes(P.stopEdge) ? L : W;
+    const across = (['left', 'right'].includes(P.stopEdge) ? W : L) - F - t;
+    const bxA = ['left', 'right'].includes(P.stopEdge) ? [bx[1], bx[3]] : [bx[0], bx[2]];
+    const bxB = ['left', 'right'].includes(P.stopEdge) ? [bx[0], bx[2]] : [bx[1], bx[3]];
+    P.designX = +(along / 2 - (bxA[0] + bxA[1]) / 2).toFixed(2);
+    const away = ['top', 'right'].includes(P.stopEdge) ? 1 : -1;   // duvardan uzaklaşma yönünün işareti
+    P.designY = +(across / 2 + away * (bxB[0] + bxB[1]) / 2).toFixed(2);
+  } else {
+    const wx = W - F - t, wy = L - F - t;
+    P.designX = +(wx / 2 - (bx[0] + bx[2]) / 2 * (['br', 'tr'].includes(P.stopCorner) ? -1 : 1)).toFixed(2);
+    P.designY = +(wy / 2 - (bx[1] + bx[3]) / 2 * (['tr', 'tl'].includes(P.stopCorner) ? -1 : 1)).toFixed(2);
+  }
   syncPanel(); onParamsChanged();
 });
 document.getElementById('resetBtn').addEventListener('click', () => {
   Object.assign(P, DEFAULTS);
   syncPanel(); save();
-  if (!customSVG) loadSVGText(SAMPLE_SVG, 'örnek logo', false); else scheduleRebuild();
   firstBuild = true;
+  if (!customSVG) loadSVGText(SAMPLE_SVG, 'örnek logo', false); else scheduleRebuild();
 });
 document.getElementById('exportCfg').addEventListener('click', () => {
   downloadFile(new TextEncoder().encode(JSON.stringify({ params: P, svg: customSVG, svgName: customSVGName }, null, 2)), 'soguk_damga_ayarlar.json', 'application/json');
@@ -1798,8 +2207,14 @@ for (const el of [openRange, cutRange]) el.addEventListener('input', () => apply
 for (const el of [wireChk, thinChk, ticketChk, axisChk]) el.addEventListener('change', () => applyMode());
 document.getElementById('resetView').addEventListener('click', () => fitCamera());
 
-window.stampApp = { P, DEFAULTS, male, female, get inserts() { return currentInserts; }, rebuild, buildCoupon: () => buildCoupon(curFont),
-  camera, controls, setStrict: v => { STRICT_CAPS = v; }, setMode: m => document.querySelector(`#modes button[data-mode="${m}"]`).click(), partFiles };
+window.stampApp = {
+  P, DEFAULTS, male, female, camera, controls, requestRender,
+  get inserts() { return currentInserts; }, get result() { return R; }, get shown() { return shown; }, get usingWorker() { return !!worker; },
+  setMode: m => document.querySelector(`#modes button[data-mode="${m}"]`).click(),
+  // test yardımcısı: parametreleri uygula ve tam kaliteyi bekle
+  rebuild: async () => { scheduleRebuild(); clearTimeout(timer); pending = 'full'; pump(); await ensureFull(); },
+  couponData, partFiles, get logo() { return rawLogo; }, get textData() { return textData; },
+};
 
 if (customSVG) loadSVGText(customSVG, customSVGName, true);
 else loadSVGText(SAMPLE_SVG, 'örnek logo', false);
