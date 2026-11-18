@@ -23,11 +23,12 @@
   .row { display: flex; align-items: center; gap: 8px; margin: 6px 0; }
   .row label { flex: 1; color: #c9d1db; }
   .row label small { display: block; color: var(--muted); font-size: 11px; }
-  .row input[type=number], .row select, .row input[type=text] {
+  .row input.num, .row select, .row input[type=text] {
     width: 92px; padding: 5px 6px; background: #0e1116; color: var(--text);
     border: 1px solid var(--line); border-radius: 5px; font: inherit;
   }
-  .row input[type=number] { text-align: right; width: 78px; }
+  .row input.num { text-align: right; width: 78px; }
+  .row input.num.bad { border-color: var(--err); background: #2a1515; }
   .row select { width: 150px; }
   .row input[type=text] { width: 150px; }
   textarea { width: 100%; min-height: 54px; resize: vertical; padding: 6px; background: #0e1116; color: var(--text); border: 1px solid var(--line); border-radius: 5px; font: 14px/1.35 inherit; }
@@ -148,7 +149,7 @@
     <div class="row" id="optOpen"><label>Kalıp açıklığı</label><input type="range" id="openRange" min="0" max="25" step="0.1" value="0"><span class="val" id="openVal">0 mm</span></div>
     <div class="row" id="optCut"><label>Kesit kaydır</label><input type="range" id="cutRange" min="-25" max="25" step="0.1" value="0"><span class="val" id="cutVal">0 mm</span></div>
     <div class="row" id="optWire"><label>Tel kafes katmanı</label><input type="checkbox" id="wireChk" checked></div>
-    <div class="row"><label>İnce bölgeleri göster</label><input type="checkbox" id="thinChk" checked></div>
+    <div class="row"><label>Sorunlu bölgeleri göster <small style="color:var(--muted)"><span style="color:#ff2b2b">■</span> ince/hatalı <span style="color:#ff9a1f">■</span> dar boşluk</small></label><input type="checkbox" id="thinChk" checked></div>
     <div class="row"><label>Bileti göster</label><input type="checkbox" id="ticketChk" checked></div>
     <div class="row"><label><span style="color:#22d3ee">●</span> Pres ekseni / <span style="color:#ff3fd2">●</span> yük merkezi</label><input type="checkbox" id="axisChk" checked></div>
     <div class="row" id="optHint" style="color:var(--muted);font-size:11px"></div>
@@ -648,8 +649,12 @@ function layout() {
   const k = edge ? (EDGE_K[P.stopEdge] || 0) : (CORNER_K[P.stopCorner] || 0);
   const Wwld = P.baseW, Lwld = P.baseL;
   const W = k % 2 ? Lwld : Wwld, L = k % 2 ? Wwld : Lwld;   // kanonik ölçüler
-  const F = P.flangeW, t = P.wallT;
+  const t = P.wallT;
   const holeD = P.guideD + P.pinTol;
+  // pim deliği (ağız pahı dahil) flanşa sığmalı: kenara ve duvar kanalına ≥0.75 mm et kalsın
+  const holeOuter = holeD + 2 * Math.min(P.holeChamfer || 0, 1);
+  const Fmin = Math.max(holeOuter + 2.5, holeOuter + 2 * P.wallGap + 1.5, P.guideD + P.pressFit + 2.5);
+  const F = Math.max(P.flangeW, Math.ceil(Fmin * 10) / 10), Fauto = F > P.flangeW;
   const m = Math.max(F / 2, holeD / 2 + 2.5);
   const pins = edge ? [{ x: m, y: F / 2 }, { x: W - m, y: F / 2 }] : [{ x: F / 2, y: L - F / 2 }, { x: W - F / 2, y: F / 2 }];
   const ox = edge ? 0 : F + t, oy = F + t; // kağıt köşesi / kenarı (çalışma alanı başlangıcı)
@@ -664,7 +669,7 @@ function layout() {
     const r = k === 1 ? [v, -u] : k === 2 ? [-u, -v] : k === 3 ? [-v, u] : [u, v];
     return [r[0] + W / 2, r[1] + L / 2];
   };
-  return { W, L, Wwld, Lwld, F, t, k, edge, holeD, pins, ox, oy, cx: W / 2, cy: L / 2, toWorld, toCanon };
+  return { W, L, Wwld, Lwld, F, Fauto, Fmin, t, k, edge, holeD, pins, ox, oy, cx: W / 2, cy: L / 2, toWorld, toCanon };
 }
 const wallPoly = G => G.edge ? rect(0, G.F, G.W, G.F + G.t)
   : [pt(G.F, G.F), pt(G.W, G.F), pt(G.W, G.F + G.t), pt(G.F + G.t, G.F + G.t), pt(G.F + G.t, G.L), pt(G.F, G.L)];
@@ -1132,7 +1137,6 @@ function buildAll(params, inp, quality) {
   P = params; Q.preview = quality === 'preview';
   const TM = {}; let _t = Date.now(); const tick = k => { const n = Date.now(); TM[k] = n - _t; _t = n; };
   const G = layout();
-  if (G.F < G.holeD + 2.5) throw new Error(`Pim flanşı en az ${(G.holeD + 2.5).toFixed(1)} mm olmalı.`);
   const designKey = JSON.stringify([DESIGN_KEYS.map(k => P[k]), STATE.logoVer, inp.textVer]);
   const comp = memo('comp', designKey, () => composeDesign(inp, G)); tick('compose');
   const AX = computeAxis(comp, G);
@@ -1160,7 +1164,7 @@ function buildAll(params, inp, quality) {
       const a = G.toWorld(G.ox, G.oy), b = G.toWorld(G.ox + tw, G.oy + th);
       return { x0: Math.min(a[0], b[0]), y0: Math.min(a[1], b[1]), x1: Math.max(a[0], b[0]), y1: Math.max(a[1], b[1]) };
     })(),
-    comp: { w: comp.w, h: comp.h, bx: comp.bx },
+    comp: { w: comp.w, h: comp.h, bx: comp.bx }, F: G.F,
     effH: H, effCD: cd, LH: LH(),
   };
   if (Q.preview) return out;
@@ -1178,19 +1182,39 @@ function buildAll(params, inp, quality) {
     const thinRibs = gaps.length ? thinParts(gaps, P.minRib + 2 * expand, 0.25) : [];
     return { thin, thinRibs, expand, wallHit: interArea(design, offsetPaths([wallPoly(G)], U(0.3))) };
   });
-  out.thinTris = worldify(flatTris(chk.thin, lower.zTop + (emb ? H : 0) + 0.03), G);
-  out.ribTris = worldify(flatTris(chk.thinRibs, lower.zTop + 0.03), G);
+  // Sorunlu bölgeler her iki kalıbın kendi üzerinde işaretlenir (kırmızı = hata/ince, turuncu = dar boşluk)
+  const safe = [rect((G.edge ? 1.2 : G.ox + P.wallGap + 0.8), G.oy + P.wallGap + 0.8, G.W - 1.2, G.L - 1.2)];
+  const cavFace = emb ? upper.cavFace : lower.cavFace;
+  const cavOut = cavFace.length ? difference(cavFace, safe, 2000) : [];
+  const wallHitArea = chk.wallHit > 0.0005 ? intersection(design, offsetPaths([wallPoly(G)], U(0.3))) : [];
+  let nutFloor = [];
+  if (emb && P.upperType === 'nut' && P.upperT - upper.nd - cd < 1.0) nutFloor = intersection(upper.cavFace, upper.hex, 2000);
+  let holeFloor = [];
+  if (!emb && P.lowerType === 'hole' && P.lowerT - lower.lhd - cd < 1.0) holeFloor = intersection(lower.cavFace, [circle(AX.x, AX.y, P.lowerHoleD / 2, 64)], 2000);
+  const zL = lower.zTop + 0.03, zU = -0.03;   // üst kalıp montaj çerçevesinde: yüz z=0, aşağı bakar
+  const mk = (paths, z) => paths.length ? worldify(flatTris(paths, z), G) : new Float32Array(0);
+  const cat = (...arrs) => { const n = arrs.reduce((a, b) => a + b.length, 0), o = new Float32Array(n); let i = 0; for (const a of arrs) { o.set(a, i); i += a.length; } return o; };
+  if (emb) {
+    out.thinTris = cat(mk(chk.thin, lower.zTop + H + 0.03), mk(wallHitArea, lower.zTop + H + 0.03));     // erkek desen (alt)
+    out.ribTris = new Float32Array(0);
+    out.upThinTris = cat(mk(cavOut, zU), mk(nutFloor, zU));                                                // dişi (üst)
+    out.upRibTris = mk(chk.thinRibs, zU);
+  } else {
+    out.thinTris = cat(mk(cavOut, zL), mk(wallHitArea, zL), mk(holeFloor, zL));                            // dişi (alt)
+    out.ribTris = mk(chk.thinRibs, zL);
+    out.upThinTris = mk(chk.thin, -H - 0.03);                                                              // erkek desen (üst)
+    out.upRibTris = new Float32Array(0);
+  }
 
   const warn = [], W_ = (k, t) => warn.push([k, t]);
   const thinA = areaMM2(chk.thin), ribA = areaMM2(chk.thinRibs);
-  const cavFace = emb ? upper.cavFace : lower.cavFace;
   if (inp.fontErr && P.textMode !== 'none') W_('err', 'Font yüklenemedi: ' + inp.fontErr + '. İnternet bağlantısını kontrol edin.');
+  if (G.Fauto) W_('info', `Pim flanşı <b>${G.F.toFixed(1)} mm</b>'ye genişletildi (pim deliği Ø${G.holeD.toFixed(2)} için en az ${G.Fmin.toFixed(1)} mm gerekir). Çalışma alanı buna göre küçüldü.`);
   if (!design.length) W_('warn', 'Tasarım boş (logo veya yazı ekleyin).');
-  if (chk.wallHit > 0.0005) W_('err', 'Desen dayama duvarına değiyor/çakışıyor. Tasarımı duvardan uzaklaştırın.');
-  const safe = [rect((G.edge ? 1.2 : G.ox + P.wallGap + 0.8), G.oy + P.wallGap + 0.8, G.W - 1.2, G.L - 1.2)];
-  if (diffArea(cavFace, safe) > 0.001) W_('err', 'Oyuk kalıp kenarına veya duvar kanalına çok yakın/taşıyor. Tasarımı küçültün veya "Tasarımı ortala"ya basın.');
-  if (thinA > 0.3) W_('warn', `İnce çizgi: toplam <b>${thinA.toFixed(2)} mm²</b> bölge ${P.minLine} mm'den ince (kırmızı). Bu kısımlar kağıtta zayıf çıkar: harf yüksekliğini veya çizgi kalınlığını artırın.`);
-  if (ribA > 2.0) W_('warn', `Dar boşluk: toplam <b>${ribA.toFixed(2)} mm²</b> bölgede tasarım boşluğu ${(P.minRib + 2 * chk.expand).toFixed(2)} mm'den dar (turuncu). Bu boşluklar kapanır; harf içleri kaybolabilir: harf aralığını/boyunu artırın.`);
+  if (chk.wallHit > 0.0005) W_('err', 'Desen dayama duvarına değiyor/çakışıyor (kırmızı). Tasarımı duvardan uzaklaştırın.');
+  if (areaMM2(cavOut) > 0.001) W_('err', `Oyuk kalıp kenarına veya duvar kanalına çok yakın/taşıyor (${emb ? 'üst' : 'alt'} kalıpta kırmızı). Tasarımı küçültün veya "Tasarımı ortala"ya basın.`);
+  if (thinA > 0.3) W_('warn', `İnce çizgi: toplam <b>${thinA.toFixed(2)} mm²</b> bölge ${P.minLine} mm'den ince (${emb ? 'alt' : 'üst'} kalıpta kırmızı). Bu kısımlar kağıtta zayıf çıkar: harf yüksekliğini veya çizgi kalınlığını artırın.`);
+  if (ribA > 2.0) W_('warn', `Dar boşluk: toplam <b>${ribA.toFixed(2)} mm²</b> bölgede tasarım boşluğu ${(P.minRib + 2 * chk.expand).toFixed(2)} mm'den dar (${emb ? 'üst' : 'alt'} kalıpta turuncu). Bu boşluklar kapanır; harf içleri kaybolabilir: harf aralığını/boyunu artırın.`);
   if (comp.bigRaw > 0.5) W_('warn', `Büyük dolu alan: ${comp.bigRaw.toFixed(1)} mm² bölgeye Ø${P.bigD} mm daire sığıyor. Geniş dolu kabartma kartonu gerer ve buruşturur; "Kontur" veya "Kontur + tarama" seçin.`);
   if (comp.filled > 0) W_('info', `${comp.filled.toFixed(1)} mm² büyük alan ${P.fillMode === 'hatch' ? 'kontur + taramaya' : 'kontura'} çevrildi.`);
   if (!AX.inside) W_('err', `Pres ekseni izinli bölgenin dışında: bağlantı kanal/kenar/pim deliklerine çok yakın.`);
@@ -1199,12 +1223,12 @@ function buildAll(params, inp, quality) {
   if (emb && P.upperType === 'nut') {
     const floor = P.upperT - upper.nd - cd;
     if (interArea(upper.cavFace, upper.hex) > 0.001 && floor < 1.0)
-      W_('warn', `Oyuk ile somun yuvası arasında yalnızca <b>${floor.toFixed(2)} mm</b> et kalıyor. Üst plakayı <b>${(upper.nd + cd + 1).toFixed(1)} mm</b> yapın.`);
+      W_('warn', `Oyuk ile somun yuvası arasında yalnızca <b>${floor.toFixed(2)} mm</b> et kalıyor (üst kalıpta kırmızı). Üst plakayı <b>${(upper.nd + cd + 1).toFixed(1)} mm</b> yapın.`);
   }
   if (!emb && P.lowerType === 'hole') {
     const floor = P.lowerT - lower.lhd - cd;
     if (interArea(lower.cavFace, [circle(AX.x, AX.y, P.lowerHoleD / 2, 64)]) > 0.001 && floor < 1.0)
-      W_('warn', `Alt oyuk ile pres deliği arasında yalnızca <b>${floor.toFixed(2)} mm</b> et kalıyor. Alt plakayı kalınlaştırın veya delik derinliğini azaltın.`);
+      W_('warn', `Alt oyuk ile pres deliği arasında yalnızca <b>${floor.toFixed(2)} mm</b> et kalıyor (alt kalıpta kırmızı). Alt plakayı kalınlaştırın veya delik derinliğini azaltın.`);
   }
   for (const t of [...lower.warns, ...upper.warns]) W_('warn', t);
   if (!emb && P.upperType === 'stud') W_('warn', 'Ters kabartma + entegre cıvata: üst kalıp desen yukarı basılır, cıvata alta gelir ve <b>destek gerekir</b>. Desteksiz baskı için "Somun yuvası" veya "Dişli delik" seçin.');
@@ -1224,7 +1248,7 @@ function transferables(r) {
   const t = [];
   if (!r || !r.lower) return t;
   for (const p of [r.lower, r.upper, ...r.inserts.map(i => i.res)]) t.push(p.pos.buffer, p.edges.buffer);
-  if (r.thinTris) t.push(r.thinTris.buffer, r.ribTris.buffer);
+  if (r.thinTris) t.push(r.thinTris.buffer, r.ribTris.buffer, r.upThinTris.buffer, r.upRibTris.buffer);
   return t;
 }
 function handle(m) {
@@ -1477,14 +1501,14 @@ const SECTIONS = [
     { k: 'stopType', l: 'Kağıt dayaması', v: 'corner', type: 'select', opts: [['corner', 'Köşe (L-duvar)'], ['edge', 'Kenar (düz duvar)']] },
     { k: 'stopCorner', l: 'Dayama köşesi', h: 'kağıdın yaslanacağı köşe', v: 'bl', type: 'select', opts: [['bl', '↙ Sol-alt'], ['br', '↘ Sağ-alt'], ['tr', '↗ Sağ-üst'], ['tl', '↖ Sol-üst']], show: () => P.stopType === 'corner' },
     { k: 'stopEdge', l: 'Dayama kenarı', h: 'kağıdın yaslanacağı kenar', v: 'bottom', type: 'select', opts: [['bottom', '↓ Alt'], ['right', '→ Sağ'], ['top', '↑ Üst'], ['left', '← Sol']], show: () => P.stopType === 'edge' },
-    { k: 'designX', l: 'Tasarım Merkezi — Yatay', v: 19.5, step: 0.5,
+    { k: 'designX', l: 'Tasarım Merkezi — Yatay', v: 19.5, min: -50, max: 200, step: 0.5,
       h2: () => P.stopType === 'edge' ? (['left', 'right'].includes(P.stopEdge) ? 'kenar boyunca, alt uçtan' : 'kenar boyunca, sol uçtan') : 'dikey duvarın iç yüzünden' },
-    { k: 'designY', l: 'Tasarım Merkezi — Dikey', v: 19.5, step: 0.5,
+    { k: 'designY', l: 'Tasarım Merkezi — Dikey', v: 19.5, min: -50, max: 200, step: 0.5,
       h2: () => P.stopType === 'edge' ? 'duvarın iç yüzünden' : 'yatay duvarın iç yüzünden' },
-    { k: 'designRot', l: 'Tüm Tasarımı Döndür', h: 'saat yönü tersine', v: 0, step: 5, unit: '°' },
+    { k: 'designRot', l: 'Tüm Tasarımı Döndür', h: 'saat yönü tersine', v: 0, min: -360, max: 360, step: 5, unit: '°' },
     { k: 'mirror', l: 'Yatay Aynalama (Mirror)', v: false, type: 'bool' },
-    { k: 'minLine', l: 'Min. çizgi kalınlığı', h: 'daha incesi kırmızı gösterilir', v: 0.5, min: 0, step: 0.05 },
-    { k: 'minRib', l: 'Min. dişi duvar / boşluk', h: 'daha dar boşluk turuncu gösterilir', v: 0.35, min: 0, step: 0.05 },
+    { k: 'minLine', l: 'Min. çizgi kalınlığı', h: 'daha incesi kırmızı gösterilir', v: 0.5, min: 0, max: 3, step: 0.05 },
+    { k: 'minRib', l: 'Min. dişi duvar / boşluk', h: 'daha dar boşluk turuncu gösterilir', v: 0.35, min: 0, max: 3, step: 0.05 },
   ], after: `<div class="btns"><button id="centerBtn">Tasarımı çalışma alanına ortala</button></div>` },
   { title: '2 · Logo (SVG)', id: 'logo', before: `
       <div class="row"><label for="p_logoOn">Logoyu kullan</label><input type="checkbox" id="p_logoOn"><span class="unit"></span></div>
@@ -1492,10 +1516,10 @@ const SECTIONS = [
       <div class="btns"><button id="sampleBtn">Örnek logoyu yükle</button></div>
       <div class="filename" id="fileName"></div>`, fields: [
     { k: 'logoOn', v: true, type: 'bool', hidden: true },
-    { k: 'logoW', l: 'Logo Genişliği', v: 10.5, min: 0.5, step: 0.5, show: show.logo },
-    { k: 'logoDX', l: 'Logo X Kaydırma', h: 'tasarım merkezine göre', v: 0, step: 0.25, show: show.logo },
-    { k: 'logoDY', l: 'Logo Y Kaydırma', v: 0, step: 0.25, show: show.logo },
-    { k: 'logoRot', l: 'Logo Açısı', h: 'saat yönü tersine', v: 0, step: 5, unit: '°', show: show.logo },
+    { k: 'logoW', l: 'Logo Genişliği', v: 10.5, min: 0.5, max: 150, step: 0.5, show: show.logo },
+    { k: 'logoDX', l: 'Logo X Kaydırma', h: 'tasarım merkezine göre', v: 0, min: -100, max: 100, step: 0.25, show: show.logo },
+    { k: 'logoDY', l: 'Logo Y Kaydırma', v: 0, min: -100, max: 100, step: 0.25, show: show.logo },
+    { k: 'logoRot', l: 'Logo Açısı', h: 'saat yönü tersine', v: 0, min: -360, max: 360, step: 5, unit: '°', show: show.logo },
     { k: 'multiLevel', l: 'Gri tonlar = kabartma seviyesi', h: 'siyah %100, koyu gri %75, gri %50, açık gri %25', v: true, type: 'bool', show: show.logo },
   ]},
   { title: '3 · Yazı & Halkalar', id: 'text', fields: [
@@ -1503,89 +1527,89 @@ const SECTIONS = [
     { k: 'font', l: 'Font', v: 'montserrat', type: 'select', opts: Object.entries(FONTS).map(([k, f]) => [k, f.name]), show: show.text },
     { k: 'text', l: 'Metin', v: 'KAYITLI\n• ORİJİNAL •', type: 'textarea', show: show.text,
       h2: () => P.textMode === 'circle' ? '1. satır üst yay, 2. satır alt yay' : 'Her satır ayrı satır olarak yazılır' },
-    { k: 'capH', l: 'Harf Yüksekliği', h: 'büyük harf boyu', v: 3.0, min: 0.5, step: 0.1, show: show.text },
-    { k: 'letterSp', l: 'Harf Aralığı', v: 0.7, step: 0.05, show: show.text },
-    { k: 'textR', l: 'Yazı Yarıçapı', h: 'harflerin iç kenarı', v: 10.6, min: 1, step: 0.1, show: show.circ },
-    { k: 'lineSp', l: 'Satır Aralığı', h: 'harf yüksekliğinin katı', v: 1.4, min: 1, step: 0.05, show: show.flat, unit: '×' },
+    { k: 'capH', l: 'Harf Yüksekliği', h: 'büyük harf boyu', v: 3.0, min: 0.5, max: 20, step: 0.1, show: show.text },
+    { k: 'letterSp', l: 'Harf Aralığı', v: 0.7, min: -1, max: 5, step: 0.05, show: show.text },
+    { k: 'textR', l: 'Yazı Yarıçapı', h: 'harflerin iç kenarı', v: 10.6, min: 1, max: 100, step: 0.1, show: show.circ },
+    { k: 'lineSp', l: 'Satır Aralığı', h: 'harf yüksekliğinin katı', v: 1.4, min: 1, max: 4, step: 0.05, show: show.flat, unit: '×' },
     { k: 'align', l: 'Hizalama', v: 'center', type: 'select', opts: [['left', 'Sola'], ['center', 'Ortaya'], ['right', 'Sağa']], show: show.flat },
-    { k: 'textDX', l: 'Yazı X Kaydırma', h: 'dairesel modda halkalar da kayar', v: 0, step: 0.25, show: show.text },
-    { k: 'textDY', l: 'Yazı Y Kaydırma', v: 0, step: 0.25, show: show.text },
-    { k: 'textRot', l: 'Yazı Açısı', h: 'dairesel modda yazı halka üzerinde döner', v: 0, step: 5, unit: '°', show: show.text },
-    { k: 'textLevel', l: 'Yazı Kabartma Seviyesi', v: 100, min: 10, step: 5, unit: '%', show: show.text },
+    { k: 'textDX', l: 'Yazı X Kaydırma', h: 'dairesel modda halkalar da kayar', v: 0, min: -100, max: 100, step: 0.25, show: show.text },
+    { k: 'textDY', l: 'Yazı Y Kaydırma', v: 0, min: -100, max: 100, step: 0.25, show: show.text },
+    { k: 'textRot', l: 'Yazı Açısı', h: 'dairesel modda yazı halka üzerinde döner', v: 0, min: -360, max: 360, step: 5, unit: '°', show: show.text },
+    { k: 'textLevel', l: 'Yazı Kabartma Seviyesi', v: 100, min: 10, max: 100, step: 5, unit: '%', show: show.text },
     { k: 'frameOn', l: 'Dış çerçeve halkası', v: true, type: 'bool' },
-    { k: 'frameR', l: 'Çerçeve Dış Yarıçapı', v: 16.3, min: 1, step: 0.1, show: show.frame },
-    { k: 'frameT', l: 'Çerçeve Kalınlığı', v: 0.8, min: 0.1, step: 0.05, show: show.frame },
+    { k: 'frameR', l: 'Çerçeve Dış Yarıçapı', v: 16.3, min: 1, max: 100, step: 0.1, show: show.frame },
+    { k: 'frameT', l: 'Çerçeve Kalınlığı', v: 0.8, min: 0.1, max: 10, step: 0.05, show: show.frame },
     { k: 'innerOn', l: 'İç halka', v: true, type: 'bool' },
-    { k: 'innerR', l: 'İç Halka Dış Yarıçapı', v: 8.8, min: 1, step: 0.1, show: show.inner },
-    { k: 'innerT', l: 'İç Halka Kalınlığı', v: 0.6, min: 0.1, step: 0.05, show: show.inner },
-    { k: 'ringLevel', l: 'Halka Kabartma Seviyesi', v: 70, min: 10, step: 5, unit: '%', show: show.ring },
+    { k: 'innerR', l: 'İç Halka Dış Yarıçapı', v: 8.8, min: 1, max: 100, step: 0.1, show: show.inner },
+    { k: 'innerT', l: 'İç Halka Kalınlığı', v: 0.6, min: 0.1, max: 10, step: 0.05, show: show.inner },
+    { k: 'ringLevel', l: 'Halka Kabartma Seviyesi', v: 70, min: 10, max: 100, step: 5, unit: '%', show: show.ring },
   ]},
   { title: '4 · Büyük Dolu Alanlar', id: 'fill', fields: [
     { k: 'fillMode', l: 'Büyük alanlar', h: 'geniş dolu kabartma kartonu gerer/buruşturur', v: 'hatch', type: 'select', opts: [['solid', 'Dolu bırak'], ['outline', 'Sadece kontur'], ['hatch', 'Kontur + tarama']] },
-    { k: 'bigD', l: 'Büyük alan eşiği', h: 'bu çapta daire sığan alanlar', v: 4, min: 1, step: 0.5 },
-    { k: 'outlineW', l: 'Kontur Kalınlığı', v: 0.9, min: 0.3, step: 0.05, show: show.fill },
-    { k: 'hatchW', l: 'Tarama Çizgi Kalınlığı', v: 0.7, min: 0.3, step: 0.05, show: show.hatch },
-    { k: 'hatchS', l: 'Tarama Aralığı', h: 'çizgi merkezleri arası', v: 2.0, min: 0.6, step: 0.1, show: show.hatch },
-    { k: 'hatchA', l: 'Tarama Açısı', v: 45, step: 15, unit: '°', show: show.hatch },
+    { k: 'bigD', l: 'Büyük alan eşiği', h: 'bu çapta daire sığan alanlar', v: 4, min: 1, max: 50, step: 0.5 },
+    { k: 'outlineW', l: 'Kontur Kalınlığı', v: 0.9, min: 0.3, max: 5, step: 0.05, show: show.fill },
+    { k: 'hatchW', l: 'Tarama Çizgi Kalınlığı', v: 0.7, min: 0.3, max: 5, step: 0.05, show: show.hatch },
+    { k: 'hatchS', l: 'Tarama Aralığı', h: 'çizgi merkezleri arası', v: 2.0, min: 0.6, max: 10, step: 0.1, show: show.hatch },
+    { k: 'hatchA', l: 'Tarama Açısı', v: 45, min: -180, max: 180, step: 15, unit: '°', show: show.hatch },
   ]},
   { title: '5 · Kağıt & Kabartma', id: 'emboss', fields: [
     { k: 'paper', l: 'Kağıt türü', v: 'p300', type: 'select', opts: [...Object.entries(PAPERS).map(([k, p]) => [k, p.name]), ['custom', 'Özel (elle)']] },
-    { k: 'paperOff', l: 'Kağıt Kalınlığı / Dişi Offset', v: 0.30, min: 0, step: 0.01 },
-    { k: 'embossH', l: 'Kabartma Yüksekliği', h: '%100 seviye', v: 0.72, min: 0.08, step: 0.04 },
-    { k: 'cavityD', l: 'Dişi Oyuk Derinliği', v: 1.04, min: 0.08, step: 0.04 },
-    { k: 'draft', l: 'Kabartma Kenar Eğimi', h: 'dikeyden açı; kağıt yırtılmaz', v: 20, min: 0, step: 1, unit: '°' },
-    { k: 'layerH', l: 'Yazıcı İnce Katman Yüksekliği', h: 'yükseklikler bunun katına yuvarlanır', v: 0.08, min: 0.04, step: 0.02 },
+    { k: 'paperOff', l: 'Kağıt Kalınlığı / Dişi Offset', v: 0.30, min: 0, max: 2, step: 0.01 },
+    { k: 'embossH', l: 'Kabartma Yüksekliği', h: '%100 seviye', v: 0.72, min: 0.08, max: 3, step: 0.04 },
+    { k: 'cavityD', l: 'Dişi Oyuk Derinliği', v: 1.04, min: 0.08, max: 5, step: 0.04 },
+    { k: 'draft', l: 'Kabartma Kenar Eğimi', h: 'dikeyden açı; kağıt yırtılmaz', v: 20, min: 0, max: 60, step: 1, unit: '°' },
+    { k: 'layerH', l: 'Yazıcı İnce Katman Yüksekliği', h: 'yükseklikler bunun katına yuvarlanır', v: 0.08, min: 0.04, max: 0.4, step: 0.02 },
   ]},
   { title: '6 · Pres Bağlantıları', id: 'press', fields: [
     { k: 'axisMode', l: 'Pres ekseni (M8 + Ø12)', v: 'auto', type: 'select', opts: [['auto', 'Otomatik: yük merkezine hizala'], ['center', 'Plaka merkezi'], ['manual', 'Elle (X/Y)']] },
-    { k: 'axisX', l: 'Eksen X', h: 'plaka sol kenarından', v: 25, step: 0.5, show: show.manual },
-    { k: 'axisY', l: 'Eksen Y', h: 'plaka alt kenarından', v: 25, step: 0.5, show: show.manual },
+    { k: 'axisX', l: 'Eksen X', h: 'plaka sol kenarından', v: 25, min: 0, max: 300, step: 0.5, show: show.manual },
+    { k: 'axisY', l: 'Eksen Y', h: 'plaka alt kenarından', v: 25, min: 0, max: 300, step: 0.5, show: show.manual },
     { k: 'upperType', l: 'Üst kalıp bağlantısı', v: 'stud', type: 'select', opts: [['stud', 'Erkek cıvata (entegre)'], ['nut', 'Somun yuvası (dişi)'], ['thread', 'Dişli delik (dişi)']] },
     { k: 'threadSize', l: 'Diş ölçüsü', v: 'M8', type: 'select', opts: Object.keys(THREADS).map(k => [k, k + ' × ' + THREADS[k].p]) },
-    { k: 'studLen', l: 'Cıvata Boyu (dışarıda)', v: 10, min: 2, step: 0.5 },
-    { k: 'threadClear', l: 'Diş Boşluğu', h: 'yazıcı payı', v: 0.2, min: 0, step: 0.05 },
-    { k: 'nutDepth', l: 'Somun Yuvası Derinliği', v: 6.5, min: 1, step: 0.1, show: show.nut },
-    { k: 'nutClear', l: 'Somun Yuvası Payı', h: 'anahtar ağzı + pay', v: 0.2, min: 0, step: 0.05, show: show.nut },
-    { k: 'thrDepth', l: 'Dişli Delik Derinliği', v: 6, min: 1, step: 0.5, show: show.thr },
+    { k: 'studLen', l: 'Cıvata Boyu (dışarıda)', v: 10, min: 2, max: 40, step: 0.5 },
+    { k: 'threadClear', l: 'Diş Boşluğu', h: 'yazıcı payı', v: 0.2, min: 0, max: 1, step: 0.05 },
+    { k: 'nutDepth', l: 'Somun Yuvası Derinliği', v: 6.5, min: 1, max: 20, step: 0.1, show: show.nut },
+    { k: 'nutClear', l: 'Somun Yuvası Payı', h: 'anahtar ağzı + pay', v: 0.2, min: 0, max: 1, step: 0.05, show: show.nut },
+    { k: 'thrDepth', l: 'Dişli Delik Derinliği', v: 6, min: 1, max: 30, step: 0.5, show: show.thr },
     { k: 'lowerType', l: 'Alt kalıp bağlantısı', v: 'hole', type: 'select', opts: [['hole', 'Dişi delik + ayrı pim (desteksiz)'], ['pin', 'Erkek pim (entegre, destek ister)']] },
-    { k: 'pressPinD', l: 'Pres Pimi Çapı', h: '12 mm yuva için 0.2 mm pay', v: 11.8, min: 2, step: 0.1 },
-    { k: 'pressPinL', l: 'Pres Pimi Uzunluğu', h: 'kalıptan dışarıda kalan', v: 12, min: 1, step: 0.5 },
-    { k: 'lowerHoleD', l: 'Alt Delik Çapı', h: 'ayrı pim sıkı oturur', v: 12.0, min: 2, step: 0.05, show: show.lhole },
-    { k: 'lowerHoleDepth', l: 'Alt Delik Derinliği', v: 6, min: 1, step: 0.5, show: show.lhole },
+    { k: 'pressPinD', l: 'Pres Pimi Çapı', h: '12 mm yuva için 0.2 mm pay', v: 11.8, min: 2, max: 30, step: 0.1 },
+    { k: 'pressPinL', l: 'Pres Pimi Uzunluğu', h: 'kalıptan dışarıda kalan', v: 12, min: 1, max: 50, step: 0.5 },
+    { k: 'lowerHoleD', l: 'Alt Delik Çapı', h: 'ayrı pim sıkı oturur', v: 12.0, min: 2, max: 30, step: 0.05, show: show.lhole },
+    { k: 'lowerHoleDepth', l: 'Alt Delik Derinliği', v: 6, min: 1, max: 30, step: 0.5, show: show.lhole },
   ]},
   { title: '7 · Kalıp Gövde & L-Dayama', id: 'body', fields: [
-    { k: 'baseW', l: 'Taban Genişliği (X)', v: 50, min: 20, step: 1 },
-    { k: 'baseL', l: 'Taban Uzunluğu (Y)', v: 50, min: 20, step: 1 },
-    { k: 'lowerT', l: 'Alt Plaka Kalınlığı', v: 9, min: 2, step: 0.5 },
-    { k: 'upperT', l: 'Üst Plaka Kalınlığı', v: 8, min: 2, step: 0.5 },
-    { k: 'wallH', l: 'L-Duvar Yüksekliği', v: 1.8, min: 0.3, step: 0.1 },
-    { k: 'wallT', l: 'L-Duvar Kalınlığı', v: 2, min: 0.6, step: 0.1 },
-    { k: 'flangeW', l: 'Pim Flanşı Genişliği', h: 'L-duvarın arkası, kağıt ulaşmaz', v: 9, min: 4, step: 0.5 },
-    { k: 'wallGap', l: 'Duvar Kanalı Yan Boşluğu', h: 'üst kalıpta', v: 0.5, min: 0.1, step: 0.05 },
-    { k: 'grooveClear', l: 'Duvar Kanalı Üst Boşluğu', v: 0.6, min: 0.1, step: 0.1 },
+    { k: 'baseW', l: 'Taban Genişliği (X)', v: 50, min: 20, max: 200, step: 1 },
+    { k: 'baseL', l: 'Taban Uzunluğu (Y)', v: 50, min: 20, max: 200, step: 1 },
+    { k: 'lowerT', l: 'Alt Plaka Kalınlığı', v: 9, min: 2, max: 40, step: 0.5 },
+    { k: 'upperT', l: 'Üst Plaka Kalınlığı', v: 8, min: 2, max: 40, step: 0.5 },
+    { k: 'wallH', l: 'L-Duvar Yüksekliği', v: 1.8, min: 0.3, max: 10, step: 0.1 },
+    { k: 'wallT', l: 'L-Duvar Kalınlığı', v: 2, min: 0.6, max: 10, step: 0.1 },
+    { k: 'flangeW', l: 'Pim Flanşı Genişliği', h: 'L-duvarın arkası, kağıt ulaşmaz', v: 9, min: 4, max: 30, step: 0.5 },
+    { k: 'wallGap', l: 'Duvar Kanalı Yan Boşluğu', h: 'üst kalıpta', v: 0.5, min: 0.1, max: 3, step: 0.05 },
+    { k: 'grooveClear', l: 'Duvar Kanalı Üst Boşluğu', v: 0.6, min: 0.1, max: 3, step: 0.1 },
   ]},
   { title: '8 · Kılavuz Pimleri ve Delikleri', id: 'guide', fields: [
     { k: 'guideType', l: 'Pim tipi', v: 'printed', type: 'select', opts: [['printed', 'Entegre (alt kalıpla tek parça)'], ['steel', 'Ayrı pim (çelik / basılı ek)']] },
-    { k: 'guideD', l: 'Kılavuz Pimi Çapı', v: 4, min: 1, step: 0.1 },
-    { k: 'guideH', l: 'Kılavuz Pimi Boyu', h: 'plakadan yükseklik', v: 5, min: 1, step: 0.5 },
-    { k: 'pinChamfer', l: 'Pim Ucu Pahı (45°)', v: 0.6, min: 0, step: 0.1 },
-    { k: 'pinTol', l: 'Pim-Delik Toleransı', h: 'üst delik Ø = pim Ø + tolerans', v: 0.3, min: 0, step: 0.05 },
+    { k: 'guideD', l: 'Kılavuz Pimi Çapı', v: 4, min: 1, max: 12, step: 0.1 },
+    { k: 'guideH', l: 'Kılavuz Pimi Boyu', h: 'plakadan yükseklik', v: 5, min: 1, max: 30, step: 0.5 },
+    { k: 'pinChamfer', l: 'Pim Ucu Pahı (45°)', v: 0.6, min: 0, max: 3, step: 0.1 },
+    { k: 'pinTol', l: 'Pim-Delik Toleransı', h: 'üst delik Ø = pim Ø + tolerans', v: 0.3, min: 0, max: 2, step: 0.05 },
     { k: 'upperHoleMode', l: 'Üst kalıp pim deliği', v: 'blind', type: 'select', opts: [['blind', 'Kör delik'], ['through', 'Boydan boya (patlak)']] },
-    { k: 'holeExtra', l: 'Üst Delik Ek Derinliği', h: 'derinlik = pim boyu + bu', v: 1.0, min: 0, step: 0.1, show: show.upBlind },
-    { k: 'holeChamfer', l: 'Delik Ağzı Pahı', h: 'pim kolay girer', v: 0.4, min: 0, step: 0.1 },
+    { k: 'holeExtra', l: 'Üst Delik Ek Derinliği', h: 'derinlik = pim boyu + bu', v: 1.0, min: 0, max: 10, step: 0.1, show: show.upBlind },
+    { k: 'holeChamfer', l: 'Delik Ağzı Pahı', h: 'pim kolay girer', v: 0.4, min: 0, max: 2, step: 0.1 },
     { k: 'lowerHoleMode', l: 'Alt kalıp pim deliği', v: 'blind', type: 'select', opts: [['blind', 'Kör delik'], ['through', 'Boydan boya (pim alttan itilir)']], show: show.steel },
-    { k: 'pressFit', l: 'Alt Delik Sıkı Geçme Payı', v: 0.1, min: 0, step: 0.05, show: show.steel },
-    { k: 'lowerPinDepth', l: 'Alt Pim Deliği Derinliği', v: 5, min: 1, step: 0.5, show: show.steelBlind },
+    { k: 'pressFit', l: 'Alt Delik Sıkı Geçme Payı', v: 0.1, min: 0, max: 1, step: 0.05, show: show.steel },
+    { k: 'lowerPinDepth', l: 'Alt Pim Deliği Derinliği', v: 5, min: 1, max: 30, step: 0.5, show: show.steelBlind },
   ]},
   { title: '9 · Kalıp Arkası Yazı', id: 'back', fields: [
     { k: 'backOn', l: 'Arkaya ALT / ÜST yaz', v: true, type: 'bool' },
     { k: 'backLabel', l: 'Ek etiket', h: 'ör. tasarım adı (boş olabilir)', v: '', type: 'text', show: show.back },
-    { k: 'backH', l: 'Yazı Yüksekliği', v: 3.5, min: 1, step: 0.5, show: show.back },
-    { k: 'backDepth', l: 'Kazıma Derinliği', h: 'sığ: baskıyı zorlamaz', v: 0.4, min: 0.1, step: 0.04, show: show.back },
+    { k: 'backH', l: 'Yazı Yüksekliği', v: 3.5, min: 1, max: 15, step: 0.5, show: show.back },
+    { k: 'backDepth', l: 'Kazıma Derinliği', h: 'sığ: baskıyı zorlamaz', v: 0.4, min: 0.1, max: 2, step: 0.04, show: show.back },
   ]},
   { title: '10 · Bilet Önizleme', id: 'ticket', open: false, fields: [
-    { k: 'ticketW', l: 'Bilet Genişliği', v: 150, min: 10, step: 1 },
-    { k: 'ticketH', l: 'Bilet Yüksekliği', v: 60, min: 10, step: 1 },
+    { k: 'ticketW', l: 'Bilet Genişliği', v: 150, min: 10, max: 500, step: 1 },
+    { k: 'ticketH', l: 'Bilet Yüksekliği', v: 60, min: 10, max: 500, step: 1 },
   ]},
 ];
 const P = {}, DEFAULTS = {}, FIELDS = {};
@@ -1607,7 +1631,7 @@ function buildPanel() {
       else if (f.type === 'select') row.innerHTML = `${lab}<select id="p_${f.k}">${f.opts.map(([v, t]) => `<option value="${v}">${esc(t)}</option>`).join('')}</select>`;
       else if (f.type === 'text') row.innerHTML = `${lab}<input type="text" id="p_${f.k}" maxlength="24">`;
       else if (f.type === 'textarea') { row.style.flexDirection = 'column'; row.style.alignItems = 'stretch'; row.innerHTML = `${lab}<textarea id="p_${f.k}" rows="2"></textarea>`; }
-      else row.innerHTML = `${lab}<input type="number" id="p_${f.k}" step="${f.step}" ${f.min !== undefined ? `min="${f.min}"` : ''}><span class="unit">${f.unit || 'mm'}</span>`;
+      else row.innerHTML = `${lab}<input type="text" class="num" inputmode="decimal" autocomplete="off" spellcheck="false" id="p_${f.k}" title="${rangeHint(f)}"><span class="unit">${f.unit || 'mm'}</span>`;
       body.appendChild(row);
     }
     if (sec.after) body.insertAdjacentHTML('beforeend', sec.after);
@@ -1616,24 +1640,64 @@ function buildPanel() {
   for (const k in FIELDS) {
     const f = FIELDS[k], el = document.getElementById('p_' + k);
     if (!el) continue;
+    if (!f.type) {   // sayı kutusu: virgül ve nokta kabul edilir, ↑/↓ ile adım
+      const commit = (final) => {
+        const v = parseNum(el.value);
+        const ok = v !== null && (f.min === undefined || v >= f.min) && (f.max === undefined || v <= f.max);
+        el.classList.toggle('bad', !ok && el.value.trim() !== '');
+        if (ok) { if (P[k] !== v) { P[k] = v; afterChange(k); } if (final) el.value = fmtNum(v); return; }
+        if (!final) return;
+        // kutudan çıkarken geçersiz/sınır dışı değeri düzelt ve kullanıcıya göster
+        let nv = v === null ? P[k] : Math.min(f.max ?? Infinity, Math.max(f.min ?? -Infinity, v));
+        el.classList.remove('bad');
+        el.value = fmtNum(nv);
+        if (P[k] !== nv) { P[k] = nv; afterChange(k); }
+      };
+      el.addEventListener('input', () => commit(false));
+      el.addEventListener('change', () => commit(true));
+      el.addEventListener('blur', () => commit(true));
+      el.addEventListener('keydown', e => {
+        if (e.key === 'Enter') { commit(true); el.blur(); return; }
+        if (e.key !== 'ArrowUp' && e.key !== 'ArrowDown') return;
+        e.preventDefault();
+        const st = (f.step || 1) * (e.shiftKey ? 10 : 1) * (e.key === 'ArrowUp' ? 1 : -1);
+        const cur = parseNum(el.value) ?? P[k];
+        const nv = +Math.min(f.max ?? Infinity, Math.max(f.min ?? -Infinity, cur + st)).toFixed(4);
+        el.value = fmtNum(nv); commit(false);
+      });
+      continue;
+    }
     const ev = (f.type === 'bool' || f.type === 'select') ? 'change' : 'input';
     el.addEventListener(ev, () => {
       if (f.type === 'bool') P[k] = el.checked;
-      else if (f.type === 'select' || f.type === 'text' || f.type === 'textarea') P[k] = el.value;
-      else { let v = parseFloat(el.value); if (!isFinite(v)) return; if (f.min !== undefined && v < f.min) v = f.min; P[k] = v; }
-      if (k === 'paper' && PAPERS[P.paper]) { Object.assign(P, { paperOff: PAPERS[P.paper].paperOff, embossH: PAPERS[P.paper].embossH, cavityD: PAPERS[P.paper].cavityD }); syncPanel(); }
-      if (['paperOff', 'embossH', 'cavityD'].includes(k)) { P.paper = 'custom'; const ps = document.getElementById('p_paper'); if (ps) ps.value = 'custom'; }
-      onParamsChanged();
+      else P[k] = el.value;
+      afterChange(k);
     });
   }
   syncPanel();
 }
+function afterChange(k) {
+  {
+      if (k === 'paper' && PAPERS[P.paper]) { Object.assign(P, { paperOff: PAPERS[P.paper].paperOff, embossH: PAPERS[P.paper].embossH, cavityD: PAPERS[P.paper].cavityD }); syncPanel(); }
+      if (['paperOff', 'embossH', 'cavityD'].includes(k)) { P.paper = 'custom'; const ps = document.getElementById('p_paper'); if (ps) ps.value = 'custom'; }
+      onParamsChanged();
+  }
+}
+// "4,5" ve "4.5" ikisi de 4.5; yarım girişler ("4,", "-", "") geçersiz sayılır
+function parseNum(str) {
+  const t = String(str).trim().replace(/\s/g, '').replace(',', '.');
+  if (!/^-?\d*\.?\d+$|^-?\d+\.$/.test(t) || /\.$/.test(t)) return null;
+  const v = Number(t);
+  return Number.isFinite(v) ? v : null;
+}
+const fmtNum = v => String(+(+v).toFixed(4));
+const rangeHint = f => [f.min !== undefined ? 'en az ' + f.min : '', f.max !== undefined ? 'en çok ' + f.max : ''].filter(Boolean).join(', ') + ' — virgül veya nokta kullanılabilir, ↑/↓ ile değiştirilir';
 function syncPanel() {
   for (const k in FIELDS) {
     const f = FIELDS[k], el = document.getElementById('p_' + k);
     if (!el) continue;
     if (f.type === 'bool') el.checked = !!P[k];
-    else if (document.activeElement !== el) el.value = (typeof P[k] === 'number') ? +P[k].toFixed(3) : P[k];
+    else if (document.activeElement !== el) { el.value = (typeof P[k] === 'number') ? fmtNum(P[k]) : P[k]; el.classList.remove('bad'); }
   }
   updateVisibility();
 }
@@ -1657,9 +1721,17 @@ function loadSaved() {
   try {
     const d = JSON.parse(localStorage.getItem(LS_KEY) || 'null');
     if (!d) return;
-    if (d.params) for (const k in d.params) if (k in DEFAULTS && typeof d.params[k] === typeof DEFAULTS[k]) P[k] = d.params[k];
+    if (d.params) for (const k in d.params) if (validParam(k, d.params[k])) P[k] = d.params[k];
     if (d.svg) { customSVG = d.svg; customSVGName = d.svgName || 'kayıtlı SVG'; }
   } catch (e) {}
+}
+// Kayıtlı/içe aktarılan değerleri doğrula (ör. eski bir virgül hatasından kalan 45 mm pim çapı yüklenmesin)
+function validParam(k, v) {
+  if (!(k in DEFAULTS) || typeof v !== typeof DEFAULTS[k]) return false;
+  const f = FIELDS[k];
+  if (typeof v === 'number') return Number.isFinite(v) && (f.min === undefined || v >= f.min) && (f.max === undefined || v <= f.max);
+  if (f && f.type === 'select') return f.opts.some(o => o[0] === v);
+  return true;
 }
 function onParamsChanged() { updateVisibility(); save(); scheduleRebuild(); }
 
@@ -1845,6 +1917,8 @@ const male = makePart(maleMats);
 const female = makePart(femaleMats);
 const overlays = new THREE.Group();
 male.group.add(overlays);
+const overlaysU = new THREE.Group();   // üst kalıp sorun işaretleri (üst kalıpla birlikte döner)
+female.group.add(overlaysU);
 const insertRow = new THREE.Group();
 scene.add(male.group, female.group, insertRow);
 let insertParts = [], currentInserts = [], R = null;   // R: son gösterilen sonuç
@@ -1864,7 +1938,7 @@ function triMesh(tris, color) {
 let mode = 0, lastMode = -1;
 const openRange = document.getElementById('openRange'), cutRange = document.getElementById('cutRange');
 const wireChk = document.getElementById('wireChk'), thinChk = document.getElementById('thinChk'), ticketChk = document.getElementById('ticketChk'), axisChk = document.getElementById('axisChk');
-let thinMesh = null, ribMesh = null, ticketMesh = null, ticketEdge = null, axisMarks = null;
+let thinMesh = null, ribMesh = null, ticketMesh = null, ticketEdge = null, axisMarks = null, upThinMesh = null, upRibMesh = null;
 function makeAxisMarks(AX, zTop) {
   const g = new THREE.Group();
   const lineG = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(AX.x, AX.y, -14), new THREE.Vector3(AX.x, AX.y, zTop + 22)]);
@@ -1906,10 +1980,9 @@ function applyMode(resetCam = false) {
   for (const part of [male, female, ...insertParts.flatMap(i => [i.row, i.mounted])]) { part.back.visible = sect; part.wire.visible = sect && wireChk.checked; }
   for (const ip of insertParts) { ip.row.group.visible = !assembled; ip.mounted.group.visible = assembled; }
   if (axisMarks) axisMarks.visible = axisChk.checked;
-  if (thinMesh) thinMesh.visible = thinChk.checked;
-  if (ribMesh) ribMesh.visible = thinChk.checked;
+  for (const m of [thinMesh, ribMesh, upThinMesh, upRibMesh]) if (m) m.visible = thinChk.checked;
   if (ticketMesh) { ticketMesh.visible = ticketChk.checked && assembled; ticketEdge.visible = ticketChk.checked && assembled; }
-  for (const m of [thinMesh, ribMesh, ticketMesh]) if (m) { m.material.clippingPlanes = planes; m.material.needsUpdate = true; }
+  for (const m of [thinMesh, ribMesh, upThinMesh, upRibMesh, ticketMesh]) if (m) { m.material.clippingPlanes = planes; m.material.needsUpdate = true; }
 
   document.getElementById('optCut').style.display = sect ? 'flex' : 'none';
   document.getElementById('optWire').style.display = sect ? 'flex' : 'none';
@@ -1984,18 +2057,16 @@ function display(r, quality, ver) {
 
   // katmanlar: ince bölgeler (yalnız tam kalitede), bilet, eksen
   for (const o of [ticketMesh, ticketEdge, axisMarks]) if (o) { overlays.remove(o); disposeObj(o); }
-  if (quality === 'full' || (thinMesh && shown.ver !== ver)) {
-    for (const o of [thinMesh, ribMesh]) if (o) { overlays.remove(o); disposeObj(o); }
-    thinMesh = ribMesh = null;
-  }
+  // sorun işaretleri yalnız tam kalitede hesaplanır; önizlemede eskileri kaldır
+  for (const o of [thinMesh, ribMesh, upThinMesh, upRibMesh]) if (o) { o.parent && o.parent.remove(o); disposeObj(o); }
+  thinMesh = ribMesh = upThinMesh = upRibMesh = null;
   if (quality === 'full') {
     thinMesh = triMesh(r.thinTris, 0xff2b2b);
     ribMesh = triMesh(r.ribTris, 0xff9a1f);
-    if (thinMesh) overlays.add(thinMesh);
-    if (ribMesh) overlays.add(ribMesh);
-  } else {
-    for (const o of [thinMesh, ribMesh]) if (o) { overlays.remove(o); disposeObj(o); }
-    thinMesh = ribMesh = null;
+    upThinMesh = triMesh(r.upThinTris, 0xff2b2b);
+    upRibMesh = triMesh(r.upRibTris, 0xff9a1f);
+    for (const m of [thinMesh, ribMesh]) if (m) overlays.add(m);
+    for (const m of [upThinMesh, upRibMesh]) if (m) overlaysU.add(m);
   }
   const t = r.ticket, zT = r.lowerInfo.zTop, th = Math.max(P.paperOff, 0.05);
   const tg = new THREE.BoxGeometry(t.x1 - t.x0, t.y1 - t.y0, th);
@@ -2157,7 +2228,7 @@ document.getElementById('sampleBtn').addEventListener('click', () => { document.
 document.getElementById('centerBtn').addEventListener('click', () => {
   // çalışma alanı (dünya yönünde) ortası; tasarım kutusunun merkezi oraya gelsin
   const bx = lastComp.bx || [0, 0, 0, 0];
-  const edge = P.stopType === 'edge', F = P.flangeW, t = P.wallT;
+  const edge = P.stopType === 'edge', F = (R && R.F) || P.flangeW, t = P.wallT;
   const W = P.baseW, L = P.baseL;
   if (edge) {
     const along = ['left', 'right'].includes(P.stopEdge) ? L : W;
@@ -2191,7 +2262,7 @@ document.getElementById('importCfg').addEventListener('change', e => {
     try {
       const d = JSON.parse(String(r.result));
       const params = d.params || d;
-      for (const k in params) if (k in DEFAULTS && typeof params[k] === typeof DEFAULTS[k]) P[k] = params[k];
+      for (const k in params) if (validParam(k, params[k])) P[k] = params[k];
       syncPanel();
       if (d.svg) loadSVGText(d.svg, d.svgName || 'içe aktarılan SVG', true); else { save(); scheduleRebuild(); }
     } catch (err) { alert('Ayar dosyası okunamadı: ' + err.message); }
