@@ -61,7 +61,7 @@
   .hint { color: var(--muted); font-size: 11px; margin: 4px 0; }
 
   #view { flex: 1; position: relative; min-width: 0; }
-  #view canvas { display: block; width: 100%; height: 100%; }
+  #view > canvas { display: block; width: 100%; height: 100%; }
   .overlay { position: absolute; pointer-events: none; }
   .overlay > * { pointer-events: auto; }
   #topbar { top: 12px; left: 12px; right: 12px; display: flex; justify-content: space-between; gap: 10px; flex-wrap: wrap; align-items: flex-start; }
@@ -78,7 +78,11 @@
   #status .part { display: flex; gap: 8px; align-items: center; }
   .dot { width: 10px; height: 10px; border-radius: 3px; display: inline-block; flex: none; }
   .good { color: var(--ok); } .bad { color: var(--err); }
-  #busy { right: 12px; bottom: 12px; color: var(--muted); font-size: 12px; display: none; }
+  #busy { right: 152px; bottom: 12px; color: var(--muted); font-size: 12px; display: none; }
+  #gizmoBox { right: 12px; bottom: 12px; display: flex; flex-direction: column; align-items: flex-end; gap: 6px; }
+  #gizmo { width: 128px; height: 128px; cursor: pointer; background: rgba(22,26,32,.72); border: 1px solid var(--line); border-radius: 50%; }
+  #viewBtns { display: flex; flex-wrap: wrap; gap: 4px; justify-content: flex-end; max-width: 210px; }
+  #viewBtns button { padding: 4px 7px; font-size: 11px; background: rgba(22,26,32,.92); }
 
   @media (max-width: 820px) {
     body { flex-direction: column-reverse; }
@@ -86,6 +90,9 @@
     #view { height: 52vh; flex: none; }
     .seg button { padding: 7px 8px; font-size: 12px; }
     #viewopts { display: none !important; }
+    #gizmoBox { bottom: auto; top: 98px; }
+    #gizmo { width: 96px; height: 96px; }
+    #viewBtns { max-width: 150px; }
   }
 </style>
 <script src="https://cdn.jsdelivr.net/npm/clipper-lib@6.4.2/clipper.js"></script>
@@ -156,6 +163,16 @@
   </div>
   <div id="status" class="overlay card"></div>
   <div id="busy" class="overlay card">Hesaplanıyor…</div>
+  <div id="gizmoBox" class="overlay">
+    <div id="viewBtns">
+      <button data-view="top" title="Üstten (Z ekseni boyunca)">Üst</button>
+      <button data-view="front" title="Önden (−Y yönünden)">Ön</button>
+      <button data-view="right" title="Sağdan (+X yönünden)">Sağ</button>
+      <button data-view="iso" title="İzometrik">İzo</button>
+      <button data-view="fit" title="Tümünü sığdır">Sığdır</button>
+    </div>
+    <canvas id="gizmo" title="Eksene tıklayın: görünüm o eksen yönünden olur"></canvas>
+  </div>
 </main>
 
 
@@ -1869,10 +1886,18 @@ renderer.localClippingEnabled = true;
 view.prepend(renderer.domElement);
 const scene = new THREE.Scene();
 scene.background = new THREE.Color(0x14181e);
-const camera = new THREE.PerspectiveCamera(40, 1, 0.5, 5000);
+// Perspektifsiz (ortografik) kamera: ölçüler ekranda bozulmadan görünür
+const camera = new THREE.OrthographicCamera(-50, 50, 50, -50, 0.1, 5000);
 camera.up.set(0, 0, 1);
+let viewHalf = 50;   // zoom=1'de görünen yarı yükseklik (mm)
+function updateFrustum() {
+  const a = view.clientWidth / Math.max(view.clientHeight, 1);
+  camera.left = -viewHalf * a; camera.right = viewHalf * a; camera.top = viewHalf; camera.bottom = -viewHalf;
+  camera.updateProjectionMatrix();
+}
 const controls = new OrbitControls(camera, renderer.domElement);
 controls.enableDamping = true; controls.dampingFactor = 0.12;
+controls.zoomToCursor = true;
 let needRender = true;
 const requestRender = () => { needRender = true; };
 controls.addEventListener('change', requestRender);
@@ -1999,35 +2024,129 @@ function applyMode(resetCam = false) {
   lastMode = mode;
   requestRender();
 }
-function fitCamera() {
+function sceneBox() {
   const box = new THREE.Box3();
   scene.updateMatrixWorld(true);
   box.expandByObject(male.mesh); box.expandByObject(female.mesh);
-  if (mode === 0) for (const ip of insertParts) box.expandByObject(ip.row.mesh);
+  if (mode === 0) for (const ip of insertParts) if (ip.row.group.visible) box.expandByObject(ip.row.mesh);
+  return box;
+}
+// Kamerayı verilen yönden (hedeften kameraya doğru birim vektör) tüm parçaları sığdıracak şekilde konumla
+function viewFrom(dir, animate = true) {
+  const box = sceneBox();
   if (box.isEmpty()) return;
   const c = box.getCenter(new THREE.Vector3());
-  const size = box.getSize(new THREE.Vector3()).length();
-  const dir = mode === 0 ? new THREE.Vector3(-0.15, -1, 0.9) : mode === 1 ? new THREE.Vector3(0.75, -1, 0.75)
-    : new THREE.Vector3(-section.normal.x, -section.normal.y, 0).normalize().add(new THREE.Vector3(0.25 * section.normal.y, -0.25 * section.normal.x, 0.45));
-  dir.normalize();
-  const dist = size / (2 * Math.tan(THREE.MathUtils.degToRad(camera.fov) / 2)) * 0.95;
-  controls.target.copy(c);
-  camera.position.copy(c).addScaledVector(dir, dist);
-  camera.near = dist / 100; camera.far = dist * 20; camera.updateProjectionMatrix();
+  const size = Math.max(box.getSize(new THREE.Vector3()).length(), 10);
+  const d = dir.clone().normalize();
+  if (Math.abs(d.z) > 0.9999) d.set(0, -1e-4, Math.sign(d.z)).normalize();   // tam üst/alt: yukarı vektörü kararlı kalsın
+  // ekranda sığacak yarı yükseklik: kutunun bu yöndeki izdüşümüne göre
+  const right = new THREE.Vector3().crossVectors(new THREE.Vector3(0, 0, 1), d);
+  if (right.lengthSq() < 1e-8) right.set(1, 0, 0); right.normalize();
+  const up = new THREE.Vector3().crossVectors(d, right).normalize();
+  const corners = [];
+  for (const x of [box.min.x, box.max.x]) for (const y of [box.min.y, box.max.y]) for (const z of [box.min.z, box.max.z]) corners.push(new THREE.Vector3(x, y, z).sub(c));
+  const halfW = Math.max(...corners.map(p => Math.abs(p.dot(right)))), halfH = Math.max(...corners.map(p => Math.abs(p.dot(up))));
+  const aspect = view.clientWidth / Math.max(view.clientHeight, 1);
+  const half = Math.max(halfH, halfW / aspect) * 1.12;
+  const dist = size * 2;
+  const to = { pos: c.clone().addScaledVector(d, dist), target: c, half };
+  camera.near = 0.1; camera.far = dist + size * 3;
+  if (!animate) { applyView(to); return; }
+  tween = { t0: performance.now(), dur: 280, from: { pos: camera.position.clone(), target: controls.target.clone(), half: viewHalf / camera.zoom }, to };
+  requestRender();
+}
+function applyView(v) {
+  controls.target.copy(v.target);
+  camera.position.copy(v.pos);
+  viewHalf = v.half; camera.zoom = 1;
+  updateFrustum();
   controls.update();
   requestRender();
 }
+let tween = null;
+function stepTween(now) {
+  if (!tween) return false;
+  const t = Math.min(1, (now - tween.t0) / tween.dur), e = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
+  const f = tween.from, g = tween.to;
+  const target = f.target.clone().lerp(g.target, e);
+  // yön küresel olarak ara değerlenir (kamera merkezden uzaklığını korur)
+  const d0 = f.pos.clone().sub(f.target), d1 = g.pos.clone().sub(g.target);
+  const r = THREE.MathUtils.lerp(d0.length(), d1.length(), e);
+  const dir = d0.normalize().lerp(d1.normalize(), e);
+  if (dir.lengthSq() < 1e-6) dir.copy(d1);
+  applyView({ target, pos: target.clone().addScaledVector(dir.normalize(), r), half: THREE.MathUtils.lerp(f.half, g.half, e) });
+  if (t >= 1) tween = null;
+  return true;
+}
+const VIEWS = {
+  top: new THREE.Vector3(0, 0, 1), bottom: new THREE.Vector3(0, 0, -1),
+  front: new THREE.Vector3(0, -1, 0), back: new THREE.Vector3(0, 1, 0),
+  right: new THREE.Vector3(1, 0, 0), left: new THREE.Vector3(-1, 0, 0),
+  iso: new THREE.Vector3(1, -1, 0.9),
+};
+function fitCamera() {
+  const dir = mode === 0 ? new THREE.Vector3(-0.15, -1, 0.9) : mode === 1 ? new THREE.Vector3(0.75, -1, 0.75)
+    : new THREE.Vector3(-section.normal.x, -section.normal.y, 0).normalize().add(new THREE.Vector3(0.25 * section.normal.y, -0.25 * section.normal.x, 0.45));
+  viewFrom(dir, false);
+}
+function fitCurrent() { viewFrom(camera.position.clone().sub(controls.target)); }
 function resize() {
   const w = view.clientWidth, h = view.clientHeight;
   renderer.setSize(w, h, false);
-  camera.aspect = w / Math.max(h, 1); camera.updateProjectionMatrix();
+  updateFrustum();
   requestRender();
 }
 new ResizeObserver(resize).observe(view);
 resize();
-renderer.setAnimationLoop(() => {
+
+/* ---------- Tıklanabilir eksen göstergesi (X kırmızı, Y yeşil, Z mavi) ---------- */
+const gizmo = document.getElementById('gizmo');
+const gctx = gizmo.getContext('2d');
+let gizmoHits = [];
+function drawGizmo() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2), S2 = gizmo.clientWidth || 128, k = S2 / 128;
+  if (gizmo.width !== Math.round(S2 * dpr)) { gizmo.width = gizmo.height = Math.round(S2 * dpr); }
+  gctx.setTransform(dpr * k, 0, 0, dpr * k, 0, 0);
+  gctx.clearRect(0, 0, 128, 128);
+  const m = camera.matrixWorld.elements;
+  const right = new THREE.Vector3(m[0], m[1], m[2]), up = new THREE.Vector3(m[4], m[5], m[6]), back = new THREE.Vector3(m[8], m[9], m[10]);
+  const cx = 64, cy = 64, R = 40;   // 128 birimlik çizim alanı, gerçek boyuta ölçeklenir
+  const axes = [
+    { l: 'X', v: new THREE.Vector3(1, 0, 0), c: '#ff5a5a', view: 'right' }, { l: '-X', v: new THREE.Vector3(-1, 0, 0), c: '#ff5a5a', view: 'left' },
+    { l: 'Y', v: new THREE.Vector3(0, 1, 0), c: '#5ad46a', view: 'back' }, { l: '-Y', v: new THREE.Vector3(0, -1, 0), c: '#5ad46a', view: 'front' },
+    { l: 'Z', v: new THREE.Vector3(0, 0, 1), c: '#5aa2ff', view: 'top' }, { l: '-Z', v: new THREE.Vector3(0, 0, -1), c: '#5aa2ff', view: 'bottom' },
+  ].map(a => ({ ...a, x: cx + a.v.dot(right) * R, y: cy - a.v.dot(up) * R, depth: a.v.dot(back) }));
+  axes.sort((a, b) => a.depth - b.depth);   // arkadakiler önce
+  gizmoHits = [];
+  for (const a of axes) {
+    const pos = !a.l.startsWith('-');
+    gctx.globalAlpha = a.depth < -0.05 ? 0.55 : 1;
+    if (pos) { gctx.strokeStyle = a.c; gctx.lineWidth = 3; gctx.beginPath(); gctx.moveTo(cx, cy); gctx.lineTo(a.x, a.y); gctx.stroke(); }
+    const r = pos ? 11 : 8;
+    gctx.beginPath(); gctx.arc(a.x, a.y, r, 0, Math.PI * 2);
+    if (pos) { gctx.fillStyle = a.c; gctx.fill(); } else { gctx.fillStyle = 'rgba(20,24,30,.9)'; gctx.fill(); gctx.strokeStyle = a.c; gctx.lineWidth = 2; gctx.stroke(); }
+    gctx.fillStyle = pos ? '#0b0d10' : a.c; gctx.font = `bold ${pos ? 12 : 9}px system-ui, sans-serif`;
+    gctx.textAlign = 'center'; gctx.textBaseline = 'middle'; gctx.fillText(a.l, a.x, a.y + 0.5);
+    gizmoHits.push({ x: a.x * k, y: a.y * k, r: (r + 3) * k, view: a.view, depth: a.depth });
+  }
+  gctx.globalAlpha = 1;
+}
+gizmo.addEventListener('click', e => {
+  const rc = gizmo.getBoundingClientRect(), x = e.clientX - rc.left, y = e.clientY - rc.top;
+  // öndeki (son çizilen) önce
+  for (let i = gizmoHits.length - 1; i >= 0; i--) {
+    const h = gizmoHits[i];
+    if (Math.hypot(x - h.x, y - h.y) <= h.r) { viewFrom(VIEWS[h.view]); return; }
+  }
+});
+document.querySelectorAll('[data-view]').forEach(b => b.addEventListener('click', () => {
+  if (b.dataset.view === 'fit') fitCurrent(); else viewFrom(VIEWS[b.dataset.view]);
+}));
+
+renderer.setAnimationLoop(now => {
+  const tw = stepTween(now || performance.now());
   const moved = controls.update();
-  if (moved || needRender) { needRender = false; renderer.render(scene, camera); }
+  if (tw || moved || needRender) { needRender = false; renderer.render(scene, camera); drawGizmo(); }
 });
 
 /* =====================================================================
