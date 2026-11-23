@@ -850,7 +850,8 @@ function centroid(paths) {
 /* ---------- Pres ekseni (M8 + Ø12) ---------- */
 function computeAxis(comp, G) {
   const spec = THREADS[P.threadSize] || THREADS.M8;
-  const rUp = P.upperType === 'nut' ? (spec.af + P.nutClear) / Math.sqrt(3) : (spec.d + P.threadClear) / 2 + 0.6;
+  const rUp = P.upperType === 'nose' ? Math.max(P.shoulderD, P.noseD + P.noseClear + 2) / 2
+    : P.upperType === 'nut' ? (spec.af + P.nutClear) / Math.sqrt(3) : (spec.d + P.threadClear) / 2 + 0.6;
   const rLow = P.lowerType === 'hole' ? P.lowerHoleD / 2 : P.pressPinD / 2;
   const Rc = Math.max(rUp, rLow) + 1.5;
   const box = { x0: (G.edge ? 1 : G.ox + P.wallGap) + Rc, x1: G.W - Rc, y0: G.oy + P.wallGap + Rc, y1: G.L - Rc };
@@ -872,10 +873,11 @@ function computeAxis(comp, G) {
 function patternSolids(levels, zBase, dir) {
   const out = [], tz = tanD(), H = effH();
   for (const lv of levels) {
-    const Ht = snap(H * lv.frac);
+    const Ht = snap(H * lv.frac) + (lv.extra || 0);
     for (const [h0, h1] of stepList(Ht)) {
       const off = Ht * tz / 2 - ((h0 + h1) / 2) * tz;
-      const reg = offsetPaths(lv.paths, U(off));
+      let reg = offsetPaths(lv.base || lv.paths, U(off));
+      if (lv.clip) reg = intersection(reg, lv.clip, 2000);   // bombe bandı: eğim bütün desene, sonra banda kırp
       if (!reg.length) continue;
       const za = zBase + dir * U(h0), zb = zBase + dir * U(h1);
       out.push({ z0: Math.min(za, zb), z1: Math.max(za, zb), paths: reg });
@@ -888,11 +890,12 @@ function cavityCuts(levels, zFace, dir) {
   const out = [], tz = tanD(), H = effH(), cd = effCD(), p = P.paperOff;
   let face = [];
   for (const lv of levels) {
-    const Ht = snap(H * lv.frac);
+    const Ht = snap(H * lv.frac) + (lv.extra || 0);
     const depth = Math.max(LH(), snap(cd - (H - Ht)));
     stepList(depth).forEach(([s0, s1], j) => {
       const h = Math.min((s0 + s1) / 2 + p, Ht);
-      const reg = offsetPaths(lv.paths, U(p + Ht * tz / 2 - h * tz));
+      let reg = offsetPaths(lv.base || lv.paths, U(p + Ht * tz / 2 - h * tz));
+      if (lv.clip) reg = intersection(reg, lv.clip, 2000);
       if (!reg.length) return;
       if (j === 0) face = face.concat(reg);
       const za = zFace + dir * U(s0), zb = zFace + dir * U(s1);
@@ -903,7 +906,9 @@ function cavityCuts(levels, zFace, dir) {
 }
 function levelInfo(levels) {
   const H = effH(), cd = effCD();
-  return levels.map(l => { const Ht = snap(H * l.frac); return { frac: l.frac, Ht, depth: Math.max(LH(), snap(cd - (H - Ht))) }; });
+  const seen = new Set();
+  return levels.map(l => { const Ht = snap(H * l.frac) + (l.extra || 0); return { frac: l.frac, extra: l.extra || 0, Ht, depth: Math.max(LH(), snap(cd - (H - Ht))) }; })
+    .filter(l => { const k = l.Ht.toFixed(3); if (seen.has(k)) return false; seen.add(k); return true; });
 }
 // Arka yazı konturları ana sayfada üretilir (merkez 0,0); burada aynalanıp yerleştirilir
 function backText(paths, cx, cy, mirror) {
@@ -993,6 +998,29 @@ function buildUpper(comp, G, inp, AX) {
   if (P.upperType === 'nut') {
     nd = Math.min(P.nutDepth, T - 0.8);
     cuts.push({ z0: U(T - nd), z1: U(T), paths: [hex] });
+  } else if (P.upperType === 'nose') {
+    // Pres burnu yuvası: kalıp burna düz itilerek takılır (dönmez); kuvvet omuzdan kalıp sırtına geçer
+    const rn = (P.noseD + P.noseClear) / 2;
+    nd = Math.min(P.noseL + P.noseTipGap, T - (emb ? cd : 0) - 0.8);
+    if (nd < P.noseL + P.noseTipGap - 1e-6) warns.push(`Burun yuvası ${nd.toFixed(1)} mm ile sınırlandı (burun ${P.noseL} mm). Üst plakayı kalınlaştırın; aksi halde burun ucu yuvanın dibine dayanır.`);
+    const ch = Math.min(0.6, rn * 0.3);
+    cuts.push({ z0: U(T - nd), z1: U(T - ch), paths: [circle(AX.x, AX.y, rn, 72, true)] });
+    profiles.push(holeCham(AX.x, AX.y, rn, ch, T, -1, 72));
+    if (P.sideScrew) {
+      // Yan sıkma vidası: +X kenarından buruna yatay delik (damla kesit, baskıda desteksiz) + somun yuvası (sırttan açık)
+      const zs = T - Math.min(nd, P.noseL) / 2, r = P.screwD / 2, q = Math.SQRT2;
+      const z0 = zs - r * q, z1 = zs + r, nsl = Math.max(4, Math.ceil((z1 - z0) / 0.15));
+      for (let i = 0; i < nsl; i++) {
+        const za = z0 + (z1 - z0) * i / nsl, zb = z0 + (z1 - z0) * (i + 1) / nsl, dz = (za + zb) / 2 - zs;
+        const half = dz >= -r / q ? Math.sqrt(Math.max(0, r * r - dz * dz)) : Math.max(0, dz + r * q);   // damla ucu yüze doğru (baskıda yukarı)
+        if (half < 0.05) continue;
+        cuts.push({ z0: U(za), z1: U(zb), paths: [rect(AX.x, AX.y - half, G.W + 1, AX.y + half)] });
+      }
+      const nAF = P.screwNutAF + 0.3, nT = P.screwNutT + 0.3, nx = AX.x + rn + 2.5;
+      const nutHalf = nAF / Math.sqrt(3) + 0.2;   // köşeden köşeye yarım
+      cuts.push({ z0: U(zs - nutHalf), z1: U(T), paths: [rect(nx, AX.y - nAF / 2, nx + nT, AX.y + nAF / 2)] });
+      if (nx + nT > G.W - 1.5) warns.push('Yan vida somun yuvası kalıp kenarına çok yakın; pres eksenini veya taban ölçüsünü kontrol edin.');
+    }
   } else if (P.upperType === 'thread') {
     thd = Math.min(P.thrDepth, T - 0.5, emb ? T - cd - 0.6 : T - 0.5);
     if (thd < P.thrDepth) warns.push(`Dişli delik derinliği ${thd.toFixed(1)} mm ile sınırlandı. Üst plakayı kalınlaştırın.`);
@@ -1080,7 +1108,7 @@ function buildCoupon(labels) {
    ===================================================================== */
 const STATE = { logo: null, logoVer: null, memo: {} };
 const UI_ONLY = ['ticketW', 'ticketH', 'minLine', 'minRib', 'paper'];
-const UPPER_ONLY = ['upperType', 'threadSize', 'studLen', 'threadClear', 'nutDepth', 'nutClear', 'thrDepth', 'upperT', 'upperHoleMode', 'holeExtra', 'pinTol', 'grooveClear', 'wallGap'];
+const UPPER_ONLY = ['noseD', 'noseL', 'noseClear', 'noseTipGap', 'shoulderD', 'sideScrew', 'screwD', 'screwNutAF', 'screwNutT', 'upperType', 'threadSize', 'studLen', 'threadClear', 'nutDepth', 'nutClear', 'thrDepth', 'upperT', 'upperHoleMode', 'holeExtra', 'pinTol', 'grooveClear', 'wallGap'];
 const LOWER_ONLY = ['lowerT', 'lowerType', 'pressPinD', 'pressPinL', 'lowerHoleD', 'lowerHoleDepth', 'lowerHoleMode', 'pressFit', 'lowerPinDepth', 'pinChamfer', 'guideType'];
 const DESIGN_KEYS = ['logoOn', 'logoW', 'logoDX', 'logoDY', 'logoRot', 'multiLevel', 'textMode', 'textDX', 'textDY', 'textRot', 'textLevel',
   'frameOn', 'frameR', 'frameT', 'innerOn', 'innerR', 'innerT', 'ringLevel', 'fillMode', 'bigD', 'outlineW', 'hatchW', 'hatchS', 'hatchA',
@@ -1150,14 +1178,76 @@ function partOut(res, G) {
   return { pos, idx: res.idx, edges: worldify(edges, G), triCount: res.triCount, badEdges: res.badEdges, zMin: res.zMin, zMax: res.zMax };
 }
 
+/* ---------- Pres açıklığı → plaka kalınlıkları ---------- */
+function effThickness() {
+  const nose = P.upperType === 'nose';
+  const toTip = P.gapRef === 'tip' ? P.pressGap : P.pressGap - P.noseL;     // alt metalden burun ucuna
+  const toBack = nose ? toTip + P.noseL : toTip;                              // üst kalıp sırtının dayandığı yer
+  const avail = toBack - P.openGap;                                           // iki plakaya kalan
+  let lowerT = P.lowerT, upperT = P.upperT;
+  if (P.autoThick) {
+    const needUp = nose ? P.noseL + P.noseTipGap + Math.max(snap(P.cavityD), 0.5) + 2 : 6;
+    // iki plaka kullanılabilir yüksekliği eşit paylaşır: pres açıkken aralarında tam "kağıt sokma boşluğu" kalır
+    upperT = Math.floor(Math.min(P.maxThick, Math.max(avail / 2, needUp)) * 2) / 2;
+    lowerT = Math.floor(Math.min(P.maxThick, avail - upperT) * 2) / 2;
+    lowerT = Math.max(lowerT, 4);
+  }
+  return { lowerT, upperT, avail, toBack, fits: lowerT + upperT <= avail + 1e-6, openNow: toBack - lowerT - upperT };
+}
+/* ---------- Esneme tahmini (üst kalıp: kuvvet omuzdan/bağlantıdan girer, kağıt basıncı yüze yayılır) ---------- */
+function flexEstimate(rmax, T) {
+  const E = 3500, Gm = 1300, nu = 0.35;               // PLA (N/mm²)
+  const f = Math.min(1, Math.max(0.05, P.infill / 100));
+  const s = Math.min(P.shellT, T / 2);
+  const bendRatio = 1 - (1 - f) * Math.pow(1 - 2 * s / T, 3);     // sandviç: dolu kabuklar + seyrek çekirdek
+  const D = E * bendRatio * T * T * T / (12 * (1 - nu * nu));
+  const F = P.pressForce * 1000;
+  const spec = THREADS[P.threadSize] || THREADS.M8;
+  const b = P.upperType === 'nose' ? P.shoulderD / 2 : P.upperType === 'nut' ? spec.af / 2 : spec.d / 2 + 1;   // yükün girdiği yarıçap
+  const a = Math.max(rmax, b + 1);
+  const bend = F * a * a * (3 + nu) / (16 * Math.PI * D * (1 + nu)) * 0.5;
+  const Gc = Gm * (s * 2 / T + (1 - 2 * s / T) * f * f);           // çekirdek kayma rijitliği (seyrek dolguda çok düşer)
+  const shear = F * Math.log(a / b) / (2 * Math.PI * Gc * T);
+  return { delta: bend + shear, bend, shear, a, b };
+}
+// Bombe: kabartma/oyuk, pres ekseninden uzaklaştıkça katman katman yükselir (merkezden yüklenen plakanın esnemesini karşılar)
+function crownLevels(levels, ax, amount) {
+  const n = Math.round(amount / LH());
+  let rmax = 0;
+  for (const l of levels) for (const p of l.paths) for (const v of p) rmax = Math.max(rmax, Math.hypot(v.X / S - ax.x, v.Y / S - ax.y));
+  if (n < 1 || rmax < 1) return { levels, n: 0 };
+  // Bantlar iç içe: k. parça = desenin r ≥ r_k dışındaki kısmı, k·LH daha yüksek. Parçalar birbirinin üstüne
+  // biner (yan yana değmez) → birleşimler sağlam, sınırlarda kıl payı boşluk/çakışma oluşmaz.
+  const out = [];
+  const big = U(rmax + 20);
+  const box = [[{ X: U(ax.x) - big, Y: U(ax.y) - big }, { X: U(ax.x) + big, Y: U(ax.y) - big }, { X: U(ax.x) + big, Y: U(ax.y) + big }, { X: U(ax.x) - big, Y: U(ax.y) + big }]];
+  for (const l of levels) for (let k = 0; k <= n; k++) {
+    if (k === 0) { out.push({ frac: l.frac, extra: 0, paths: l.paths }); continue; }
+    const r0 = rmax * Math.sqrt((k - 0.5) / n);     // ikinci dereceden eğri: esneme ~ r²
+    const ext = difference(box, [circle(ax.x, ax.y, r0, segs(r0))]);
+    const part = intersection(l.paths, ext, 2000);
+    if (part.length) out.push({ frac: l.frac, extra: k * LH(), paths: part, base: l.paths, clip: ext });
+  }
+  return { levels: out, n };
+}
+
 function buildAll(params, inp, quality) {
   P = params; Q.preview = quality === 'preview';
+  const eff = effThickness();
+  P = Object.assign({}, P, { lowerT: eff.lowerT, upperT: eff.upperT });
   const TM = {}; let _t = Date.now(); const tick = k => { const n = Date.now(); TM[k] = n - _t; _t = n; };
   const G = layout();
   const designKey = JSON.stringify([DESIGN_KEYS.map(k => P[k]), STATE.logoVer, inp.textVer]);
-  const comp = memo('comp', designKey, () => composeDesign(inp, G)); tick('compose');
-  const AX = computeAxis(comp, G);
-  const axKey = [AX.x, AX.y, designKey, inp.backVer, quality];
+  const comp0 = memo('comp', designKey, () => composeDesign(inp, G)); tick('compose');
+  const AX = computeAxis(comp0, G);
+  // esneme tahmini ve bombe
+  let rmax = 0;
+  for (const p of comp0.all) for (const v of p) rmax = Math.max(rmax, Math.hypot(v.X / S - AX.x, v.Y / S - AX.y));
+  const flex = flexEstimate(rmax, eff.upperT);
+  const crownAmt = P.crownMode === 'crown' ? (P.crownAuto ? Math.max(LH(), snap(flex.delta)) : Math.max(0, snap(P.crownAmount))) : 0;
+  const cr = crownAmt > 0 ? memo('crown', JSON.stringify([designKey, AX.x, AX.y, crownAmt, P.layerH]), () => crownLevels(comp0.levels, AX, crownAmt)) : null;
+  const comp = cr ? Object.assign({}, comp0, { levels: cr.levels }) : comp0;
+  const axKey = [AX.x, AX.y, designKey, inp.backVer, quality, crownAmt];
   const lower = memo('lower' + quality, keyOf([...UI_ONLY, ...UPPER_ONLY], axKey), () => buildLower(comp, G, inp, AX)); tick('lower');
   const upper = memo('upper' + quality, keyOf([...UI_ONLY, ...LOWER_ONLY], axKey), () => buildUpper(comp, G, inp, AX)); tick('upper');
   const insKey = JSON.stringify([lower.lhd, lower.pinDepth, lower.zTop, upper.thd, upper.nd, AX.x, AX.y, G.k, quality,
@@ -1169,7 +1259,7 @@ function buildAll(params, inp, quality) {
     quality, timings: TM, k: G.k,
     lower: partOut(lower, G), upper: partOut(upper, G),
     lowerInfo: { zTop: lower.zTop, lhd: lower.lhd, height: lower.height, levels: lower.levels },
-    upperInfo: { faceDown: upper.faceDown, hd: upper.hd, gd: upper.gd, nd: upper.nd, thd: upper.thd, height: upper.height },
+    upperInfo: { nose: P.upperType === 'nose', faceDown: upper.faceDown, hd: upper.hd, gd: upper.gd, nd: upper.nd, thd: upper.thd, height: upper.height },
     inserts: inserts.map(d => {
       const w = G.toWorld(d.at[0], d.at[1]);
       return { label: d.label, file: d.file, mount: d.mount, at: [w[0], w[1], d.at[2]], res: partOut(d.res, { k: 0 }) };
@@ -1182,6 +1272,7 @@ function buildAll(params, inp, quality) {
       return { x0: Math.min(a[0], b[0]), y0: Math.min(a[1], b[1]), x1: Math.max(a[0], b[0]), y1: Math.max(a[1], b[1]) };
     })(),
     comp: { w: comp.w, h: comp.h, bx: comp.bx }, F: G.F,
+    eff, flex: { delta: flex.delta, bend: flex.bend, shear: flex.shear, rmax, crown: crownAmt, steps: cr ? cr.n : 0 },
     effH: H, effCD: cd, LH: LH(),
   };
   if (Q.preview) return out;
@@ -1226,6 +1317,15 @@ function buildAll(params, inp, quality) {
   const warn = [], W_ = (k, t) => warn.push([k, t]);
   const thinA = areaMM2(chk.thin), ribA = areaMM2(chk.thinRibs);
   if (inp.fontErr && P.textMode !== 'none') W_('err', 'Font yüklenemedi: ' + inp.fontErr + '. İnternet bağlantısını kontrol edin.');
+  if (!eff.fits) W_('err', `Kalıplar prese sığmıyor: plakalar ${eff.lowerT} + ${eff.upperT} mm, kağıt boşluğu ${P.openGap} mm ile toplam ${(eff.lowerT + eff.upperT + P.openGap).toFixed(1)} mm > ${eff.toBack.toFixed(1)} mm. Plakaları inceltin veya "Otomatik kalınlık"ı açın.`);
+  if (eff.fits && eff.openNow > P.openGap + 6) W_('info', `Pres açıkken kalıplar arasında ${eff.openNow.toFixed(1)} mm kalıyor; presin kapanması için bu kadar yol alması gerekir. Strok yetmiyorsa plakaları kalınlaştırın ("En fazla plaka kalınlığı").`);
+  if (flex.delta > 0.05) W_('warn', `Esneme tahmini: üst kalıp kenarda ortaya göre ~<b>${flex.delta.toFixed(2)} mm</b> geri kaçabilir (bükülme ${flex.bend.toFixed(3)}, dolgu ezilmesi/kayma ${flex.shear.toFixed(3)} mm). ${P.infill < 100 ? '<b>Doluluğu %100 yapın</b>; ' : ''}plakayı kalınlaştırın${P.crownMode !== 'crown' ? ' veya "Bombeli" sürümü deneyin' : ''}.`);
+  else W_('info', `Esneme tahmini: kenarda ~${flex.delta.toFixed(3)} mm (iyi).`);
+  if (crownAmt > 0) W_('info', `Bombeli: kabartma/oyuk, eksenden en uzak noktada <b>+${crownAmt.toFixed(2)} mm</b> (${cr ? cr.n : 0} kademe, ${LH()} mm adım).`);
+  if (P.upperType === 'nose' && emb) {
+    const floor = P.upperT - upper.nd - cd;
+    if (floor < 1.2) W_('warn', `Burun yuvası ile oyuk arasında yalnızca <b>${floor.toFixed(2)} mm</b> et kalıyor. Üst plakayı kalınlaştırın.`);
+  }
   if (G.Fauto) W_('info', `Pim flanşı <b>${G.F.toFixed(1)} mm</b>'ye genişletildi (pim deliği Ø${G.holeD.toFixed(2)} için en az ${G.Fmin.toFixed(1)} mm gerekir). Çalışma alanı buna göre küçüldü.`);
   if (!design.length) W_('warn', 'Tasarım boş (logo veya yazı ekleyin).');
   if (chk.wallHit > 0.0005) W_('err', 'Desen dayama duvarına değiyor/çakışıyor (kırmızı). Tasarımı duvardan uzaklaştırın.');
@@ -1498,6 +1598,12 @@ const show = {
   upBlind: () => P.upperHoleMode === 'blind',
   back: () => P.backOn,
   manual: () => P.axisMode === 'manual',
+  nose: () => P.upperType === 'nose',
+  threaded: () => P.upperType !== 'nose',
+  screw: () => P.upperType === 'nose' && P.sideScrew,
+  manualT: () => !P.autoThick,
+  crown: () => P.crownMode === 'crown',
+  crownManual: () => P.crownMode === 'crown' && !P.crownAuto,
   corner: () => P.stopType === 'corner',
   edgeStop: () => P.stopType === 'edge',
   fill: () => P.fillMode !== 'solid',
@@ -1581,10 +1687,19 @@ const SECTIONS = [
     { k: 'axisMode', l: 'Pres ekseni (M8 + Ø12)', v: 'auto', type: 'select', opts: [['auto', 'Otomatik: yük merkezine hizala'], ['center', 'Plaka merkezi'], ['manual', 'Elle (X/Y)']] },
     { k: 'axisX', l: 'Eksen X', h: 'plaka sol kenarından', v: 25, min: 0, max: 300, step: 0.5, show: show.manual },
     { k: 'axisY', l: 'Eksen Y', h: 'plaka alt kenarından', v: 25, min: 0, max: 300, step: 0.5, show: show.manual },
-    { k: 'upperType', l: 'Üst kalıp bağlantısı', v: 'stud', type: 'select', opts: [['stud', 'Erkek cıvata (entegre)'], ['nut', 'Somun yuvası (dişi)'], ['thread', 'Dişli delik (dişi)']] },
-    { k: 'threadSize', l: 'Diş ölçüsü', v: 'M8', type: 'select', opts: Object.keys(THREADS).map(k => [k, k + ' × ' + THREADS[k].p]) },
-    { k: 'studLen', l: 'Cıvata Boyu (dışarıda)', v: 10, min: 2, max: 40, step: 0.5 },
-    { k: 'threadClear', l: 'Diş Boşluğu', h: 'yazıcı payı', v: 0.2, min: 0, max: 1, step: 0.05 },
+    { k: 'upperType', l: 'Üst kalıp bağlantısı', v: 'nose', type: 'select', opts: [['nose', 'Pres burnu yuvası (döndürmeden takılır)'], ['stud', 'Erkek cıvata (entegre)'], ['nut', 'Somun yuvası (dişi)'], ['thread', 'Dişli delik (dişi)']] },
+    { k: 'noseD', l: 'Pres Burnu Çapı', h: 'üst metal ucun dış çapı', v: 9.7, min: 3, max: 40, step: 0.1, show: show.nose },
+    { k: 'noseL', l: 'Pres Burnu Boyu', h: 'uçtan omuz kademesine', v: 16, min: 2, max: 60, step: 0.5, show: show.nose },
+    { k: 'shoulderD', l: 'Omuz (Kademe) Çapı', h: 'kuvvetin kalıba geçtiği yüzey', v: 18.8, min: 5, max: 80, step: 0.1, show: show.nose },
+    { k: 'noseClear', l: 'Burun Yuvası Payı', h: 'yuva Ø = burun Ø + pay (sıkı geçme)', v: 0.2, min: 0, max: 1, step: 0.05, show: show.nose },
+    { k: 'noseTipGap', l: 'Burun Ucu Boşluğu', h: 'uç yuvanın dibine değmesin, yük omuzdan geçsin', v: 0.3, min: 0, max: 3, step: 0.1, show: show.nose },
+    { k: 'sideScrew', l: 'Yan sıkma vidası', h: 'kalıp kenarından buruna M4 vida + somun yuvası', v: false, type: 'bool', show: show.nose },
+    { k: 'screwD', l: 'Yan Vida Deliği', v: 4.3, min: 2, max: 8, step: 0.1, show: show.screw },
+    { k: 'screwNutAF', l: 'Yan Vida Somun Anahtar Ağzı', v: 7, min: 3, max: 13, step: 0.1, show: show.screw },
+    { k: 'screwNutT', l: 'Yan Vida Somun Kalınlığı', v: 3.2, min: 1, max: 8, step: 0.1, show: show.screw },
+    { k: 'threadSize', l: 'Diş ölçüsü', h: 'presin dişli ucu', v: 'M6', type: 'select', opts: Object.keys(THREADS).map(k => [k, k + ' × ' + THREADS[k].p]), show: show.threaded },
+    { k: 'studLen', l: 'Cıvata Boyu (dışarıda)', h: 'pres deliğine en fazla 4.5 mm girer', v: 4, min: 2, max: 40, step: 0.5, show: show.threaded },
+    { k: 'threadClear', l: 'Diş Boşluğu', h: 'yazıcı payı', v: 0.2, min: 0, max: 1, step: 0.05, show: show.threaded },
     { k: 'nutDepth', l: 'Somun Yuvası Derinliği', v: 6.5, min: 1, max: 20, step: 0.1, show: show.nut },
     { k: 'nutClear', l: 'Somun Yuvası Payı', h: 'anahtar ağzı + pay', v: 0.2, min: 0, max: 1, step: 0.05, show: show.nut },
     { k: 'thrDepth', l: 'Dişli Delik Derinliği', v: 6, min: 1, max: 30, step: 0.5, show: show.thr },
@@ -1592,13 +1707,26 @@ const SECTIONS = [
     { k: 'pressPinD', l: 'Pres Pimi Çapı', h: '12 mm yuva için 0.2 mm pay', v: 11.8, min: 2, max: 30, step: 0.1 },
     { k: 'pressPinL', l: 'Pres Pimi Uzunluğu', h: 'kalıptan dışarıda kalan', v: 12, min: 1, max: 50, step: 0.5 },
     { k: 'lowerHoleD', l: 'Alt Delik Çapı', h: 'ayrı pim sıkı oturur', v: 12.0, min: 2, max: 30, step: 0.05, show: show.lhole },
-    { k: 'lowerHoleDepth', l: 'Alt Delik Derinliği', v: 6, min: 1, max: 30, step: 0.5, show: show.lhole },
+    { k: 'lowerHoleDepth', l: 'Alt Delik Derinliği', v: 8, min: 1, max: 30, step: 0.5, show: show.lhole },
+  ]},
+  { title: '6b · Pres Açıklığı & Sağlamlık', id: 'rigid', fields: [
+    { k: 'pressGap', l: 'Pres Açıklığı', h: 'iki metal arası boşluk (pres tam açıkken)', v: 56, min: 10, max: 300, step: 0.5 },
+    { k: 'gapRef', l: 'Açıklık ölçüm noktası', v: 'tip', type: 'select', opts: [['tip', 'Üst burun ucundan'], ['shoulder', 'Üst omuz kademesinden']] },
+    { k: 'openGap', l: 'Kağıt Sokma Boşluğu', h: 'pres açıkken kalıplar arası', v: 8, min: 2, max: 60, step: 0.5 },
+    { k: 'autoThick', l: 'Plaka kalınlığını açıklığa göre otomatik ayarla', v: true, type: 'bool' },
+    { k: 'maxThick', l: 'En Fazla Plaka Kalınlığı', h: 'düşürürseniz pres daha uzun yol alır', v: 40, min: 4, max: 80, step: 0.5, show: () => P.autoThick },
+    { k: 'infill', l: 'Baskı Doluluğu', h: 'esneme tahmini için; önerilen %100', v: 100, min: 5, max: 100, step: 5, unit: '%' },
+    { k: 'shellT', l: 'Üst/Alt Kabuk Kalınlığı', h: 'dilimleyicideki katı katman toplamı', v: 2, min: 0.4, max: 10, step: 0.2 },
+    { k: 'pressForce', l: 'Tahmini Pres Kuvveti', h: 'el presi ≈ 1–3 kN', v: 1.5, min: 0.1, max: 20, step: 0.1, unit: 'kN' },
+    { k: 'crownMode', l: 'Kalıp sürümü', v: 'flat', type: 'select', opts: [['flat', 'Bombesiz (düz)'], ['crown', 'Bombeli (esneme telafili)']] },
+    { k: 'crownAuto', l: 'Bombe miktarını esneme tahmininden al', v: true, type: 'bool', show: show.crown },
+    { k: 'crownAmount', l: 'Kenarda Ek Yükseklik', h: 'eksenden en uzak noktada', v: 0.08, min: 0, max: 1, step: 0.04, show: show.crownManual },
   ]},
   { title: '7 · Kalıp Gövde & L-Dayama', id: 'body', fields: [
     { k: 'baseW', l: 'Taban Genişliği (X)', v: 50, min: 20, max: 200, step: 1 },
     { k: 'baseL', l: 'Taban Uzunluğu (Y)', v: 50, min: 20, max: 200, step: 1 },
-    { k: 'lowerT', l: 'Alt Plaka Kalınlığı', v: 9, min: 2, max: 40, step: 0.5 },
-    { k: 'upperT', l: 'Üst Plaka Kalınlığı', v: 8, min: 2, max: 40, step: 0.5 },
+    { k: 'lowerT', l: 'Alt Plaka Kalınlığı', h: 'otomatik kapalıyken', show: show.manualT, v: 30, min: 2, max: 80, step: 0.5 },
+    { k: 'upperT', l: 'Üst Plaka Kalınlığı', h: 'otomatik kapalıyken', show: show.manualT, v: 30, min: 2, max: 80, step: 0.5 },
     { k: 'wallH', l: 'L-Duvar Yüksekliği', v: 1.8, min: 0.3, max: 10, step: 0.1 },
     { k: 'wallT', l: 'L-Duvar Kalınlığı', v: 2, min: 0.6, max: 10, step: 0.1 },
     { k: 'flangeW', l: 'Pim Flanşı Genişliği', h: 'L-duvarın arkası, kağıt ulaşmaz', v: 9, min: 4, max: 30, step: 0.5 },
@@ -1729,7 +1857,7 @@ function updateVisibility() {
 }
 
 /* ---------- Kaydetme ---------- */
-const LS_KEY = 'stampmaker.v3';
+const LS_KEY = 'stampmaker.v4';   // yeni varsayılanlar (pres burnu, M6, 56 mm açıklık) için yeni anahtar
 let customSVG = null, customSVGName = '';
 function save() {
   try { localStorage.setItem(LS_KEY, JSON.stringify({ params: P, svg: customSVG && customSVG.length < 400000 ? customSVG : null, svgName: customSVGName })); } catch (e) {}
@@ -2201,6 +2329,8 @@ function display(r, quality, ver) {
     Tasarım: <b>${r.comp.w.toFixed(1)} × ${r.comp.h.toFixed(1)} mm</b><br>
     ${emb ? 'Kabartma' : 'Ters kabartma'}: <b>${H.toFixed(2)} mm</b>, oyuk <b>${cd.toFixed(2)} mm</b>${lv}<br>
     Pres ekseni: <b>X ${r.axis.x.toFixed(1)}, Y ${r.axis.y.toFixed(1)}</b> · yük kaçıklığı <b>${r.axis.offset.toFixed(1)} mm</b><br>
+    Plakalar: alt <b>${r.eff.lowerT} mm</b>, üst <b>${r.eff.upperT} mm</b>${P.autoThick ? ' (otomatik)' : ''} · pres açıkken kalıplar arası: <b>${r.eff.openNow.toFixed(1)} mm</b><br>
+    Esneme tahmini (kenar): <b>${r.flex.delta.toFixed(3)} mm</b>${r.flex.crown ? ` · bombe <b>+${r.flex.crown.toFixed(2)} mm</b>` : ''}<br>
     Alt kalıp: <b>${P.baseW} × ${P.baseL} × ${r.lowerInfo.height.toFixed(1)} mm</b> · Üst kalıp: <b>${P.baseW} × ${P.baseL} × ${r.upperInfo.height.toFixed(1)} mm</b><br>
     Üst pim deliği Ø<b>${(P.guideD + P.pinTol).toFixed(2)}</b> × <b>${P.upperHoleMode === 'through' ? 'boydan boya' : r.upperInfo.hd.toFixed(1)}</b> · Duvar kanalı <b>${(P.wallT + 2 * P.wallGap).toFixed(1)} × ${r.upperInfo.gd.toFixed(2)} mm</b>`;
   const prev = quality === 'preview';
@@ -2232,12 +2362,20 @@ function renderPrintCard(r) {
   const lowRange = emb ? [zTop - 0.2, zTop + Math.max(H, P.guideType === 'printed' ? P.guideH : 0)] : [zTop - cd - 0.2, zTop + P.guideH];
   const map = upperPrintMap(r);
   const up = (emb ? [0, cd + 0.2] : [-H, 0.2]).map(z => map(0, 0, z)[2]).sort((a, b) => a - b);
-  let h = `<h4>Genel ayarlar</h4>${tags(['PLA+ / PETG', 'Nozul 0.4 (detay için 0.2)', `İnce katman ${lh} mm`, 'Gövde 0.2 mm', '4–5 duvar', 'Üst/Alt 6 katman', 'Dolgu %80–100 gyroid', 'Arachne duvar'])}
+  let h = `<h4>Genel ayarlar</h4>${tags(['PLA / PLA+', 'Nozul 0.4 (detay için 0.2)', `İnce katman ${lh} mm`, 'Gövde 0.2 mm', '5 duvar', `Üst/Alt kabuk ≥ ${P.shellT} mm`, '<b>Doluluk %100</b>', 'Arachne duvar'])}
+    <div class="msg ${P.infill < 100 ? 'warn' : 'info'}"><b>Doluluk %100 olmalı.</b> Düşük dolulukta (ör. %25) kalıp ortadan bastırılınca kenarlarda esner ve yazı kenarlarda zayıf çıkar.${P.infill < 100 ? ` Şu an tahmin %${P.infill} ile yapılıyor.` : ''}</div>`;
+  h += `
     <ul><li><b>Yükseklik aralığına göre katman</b> (Bambu Studio / OrcaSlicer: nesneye sağ tık → <i>Yükseklik aralığı ekle</i>; Cura: <i>Adaptive layers</i>):<br>
-      Alt kalıp <b>${f2(lowRange[0])}–${f2(lowRange[1])} mm</b> arası ${lh} mm · Üst kalıp <b>${f2(up[0])}–${f2(up[1])} mm</b> arası ${lh} mm${P.upperType === 'stud' ? ` · cıvata bölgesi (${f2(map(0, 0, P.upperT)[2])}–${f2(map(0, 0, P.upperT + P.studLen)[2])} mm) ${lh}–0.12 mm` : ''}. Geri kalanı 0.2 mm.</li>
+      Alt kalıp <b>${f2(lowRange[0])}–${f2(lowRange[1])} mm</b> arası ${lh} mm · Üst kalıp <b>${f2(up[0])}–${f2(up[1])} mm</b> arası ${lh} mm${P.upperType === 'stud' ? ` · cıvata bölgesi (${f2(map(0, 0, r.eff.upperT)[2])}–${f2(map(0, 0, r.eff.upperT + P.studLen)[2])} mm) ${lh}–0.12 mm` : ''}. Geri kalanı 0.2 mm.</li>
     <li>Kabartma ${H.toFixed(2)} mm ve oyuk ${cd.toFixed(2)} mm, ${lh} mm katmanın tam katıdır; eğim kademeleri katmanlarla birebir örtüşür.</li>
     <li><b>Dikiş</b> arkaya hizalı (veya scarf seam), <b>önce dış duvar</b>, dış duvar 40–60 mm/s, fan %100, min. katman süresi 6–8 sn. Filamenti kurutun.</li>
     <li>Önce <b>tolerans test parçasını</b> basın: 1–5 delikleri = pim Ø +0.1…+0.5 mm, A–C yuvaları = anahtar ağzı +0.1/+0.2/+0.3 mm.</li></ul>
+    ${r.upperInfo.nose ? `<h4>Prese takma</h4><ul>
+      <li>Üst kalıbı <b>döndürmeden</b>, düz yukarı iterek pres burnuna (Ø${P.noseD}) geçirin; istediğiniz açıda durur. L-dayamayı önünüze göre çevirin.</li>
+      <li>Kalıbın sırtı Ø${P.shoulderD} omuza tam yaslanmalı; kuvvet buradan geçer. Burun ucu yuvanın dibine değmez (${P.noseTipGap} mm boşluk).</li>
+      <li>Alt kalıp pimi yuvasında serbest döner; kalıplar kapanınca kılavuz pimleri onu üst kalıba hizalar.</li>
+      <li>Gevşek gelirse "Burun Yuvası Payı"nı 0.05 mm azaltın, sıkıysa artırın.</li></ul>` : ''}
+    ${r.flex.crown ? `<h4>Bombeli sürüm</h4><ul><li>Kabartma ve oyuk eksenden uzaklaştıkça yükselir (kenarda +${r.flex.crown.toFixed(2)} mm). Önce bombesiz sürümle deneyin; kenarlar hâlâ zayıfsa bombeliyi basın. Kenarlar kağıdı kesiyorsa bombeyi azaltın.</li></ul>` : ''}
     <h4>Alt kalıp (${emb ? 'erkek' : 'dişi'})</h4><ul>
     <li>Yön: taban tablada, ${emb ? 'kabartma' : 'oyuk'} yukarı. ${P.lowerType === 'pin' ? '<b>Destek gerekli</b> (pim üstündeki plaka havada).' : 'Destek <b>gerekmez</b> (Ø' + P.lowerHoleD + ' delik tavanı köprüyle oluşur).'}</li>
     ${emb ? '<li><b>Ütüleme (ironing)</b> açın: kabartma tepeleri pürüzsüz olur.</li>' : '<li>Oyuk kenarları keskin kalsın diye üst yüzde ütüleme kapalı kalabilir.</li>'}</ul>
@@ -2286,8 +2424,9 @@ async function withFull(fn) {
   if (shown.quality !== 'full' || shown.ver !== paramsVer) { setBusy('Tam kalite hesaplanıyor…'); await ensureFull(); }
   return fn();
 }
-const lowerName = () => P.relief === 'emboss' ? 'alt_kalip_erkek.stl' : 'alt_kalip_disi.stl';
-const upperName = () => P.relief === 'emboss' ? 'ust_kalip_disi.stl' : 'ust_kalip_erkek.stl';
+const crownSfx = () => P.crownMode === 'crown' ? '_bombeli' : '';
+const lowerName = () => (P.relief === 'emboss' ? 'alt_kalip_erkek' : 'alt_kalip_disi') + crownSfx() + '.stl';
+const upperName = () => (P.relief === 'emboss' ? 'ust_kalip_disi' : 'ust_kalip_erkek') + crownSfx() + '.stl';
 function partFiles() {
   const files = { [lowerName()]: stlBytes(R.lower.pos, R.lower.idx), [upperName()]: stlBytes(upperPrintPos(), R.upper.idx) };
   const seen = new Set();
@@ -2301,7 +2440,7 @@ document.querySelectorAll('[data-dl]').forEach(b => b.addEventListener('click', 
 const downloadZip = () => withFull(() => {
   const files = partFiles();
   files['ayarlar.json'] = new TextEncoder().encode(JSON.stringify(P, null, 2));
-  downloadFile(zipSync(files, { level: 6 }), 'soguk_damga_kaliplari.zip', 'application/zip');
+  downloadFile(zipSync(files, { level: 6 }), 'soguk_damga_kaliplari' + crownSfx() + '.zip', 'application/zip');
 });
 document.getElementById('zipBtn').addEventListener('click', downloadZip);
 document.getElementById('zipBtn2').addEventListener('click', downloadZip);
