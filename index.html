@@ -1534,7 +1534,35 @@ function glyphPolys(g, fs, tf, out) {
   close();
 }
 // Düz (çok satırlı) yazı; merkez (cx,cy) mm
-function flatText(font, text, capH, spacing, lineSp, align, cx, cy, mirror = false) {
+// Satırın harf sırasını ters çevir (sağdan sola yazım); Türkçe harfler tek karakter olduğundan güvenli
+const reverseLine = s => Array.from(s).reverse().join('');
+// Dikey yazım: her satır bir sütun, harfler dik ve alt alta (ttb: yukarıdan aşağı, btt: aşağıdan yukarı)
+function verticalText(font, text, capH, spacing, lineSp, align, cx, cy, dir) {
+  const cols = text.split('\n').map(l => layoutLine(font, l, capH, 0));
+  const pitch = capH * 1.35 + spacing;                         // harf aralığı (aksanlar için pay)
+  const maxAdv = Math.max(capH * 0.6, ...cols.flatMap(c => c.items.map(it => it.adv)));
+  const colPitch = maxAdv + capH * Math.max(0, lineSp - 1) + capH * 0.25;
+  const lens = cols.map(c => c.items.length ? (c.items.length - 1) * pitch + capH : 0);
+  const maxLen = Math.max(0, ...lens);
+  const polys = [];
+  cols.forEach((c, i) => {
+    const colX = cx + (i - (cols.length - 1) / 2) * colPitch;
+    const len = lens[i];
+    // hizalama: sola = başlangıç (ttb'de üst, btt'de alt), sağa = bitiş
+    const startShift = align === 'left' ? 0 : align === 'right' ? maxLen - len : (maxLen - len) / 2;
+    c.items.forEach((it, j) => {
+      const by = dir === 'ttb'
+        ? cy + maxLen / 2 - capH - startShift - j * pitch
+        : cy - maxLen / 2 + startShift + j * pitch;
+      const bx = colX - it.adv / 2;
+      glyphPolys(it.g, c.fs, (gx, gy) => ({ X: U(bx + gx), Y: U(by + gy) }), polys);
+    });
+  });
+  return { paths: region(polys), width: cols.length * colPitch, height: maxLen };
+}
+function flatText(font, text, capH, spacing, lineSp, align, cx, cy, mirror = false, dir = 'ltr') {
+  if (dir === 'ttb' || dir === 'btt') return verticalText(font, text, capH, spacing, lineSp, align, cx, cy, dir);
+  if (dir === 'rtl') text = text.split('\n').map(reverseLine).join('\n');
   const lines = text.split('\n');
   const L = lines.map(l => layoutLine(font, l, capH, spacing));
   const maxW = Math.max(0, ...L.map(l => l.width));
@@ -1654,7 +1682,9 @@ const SECTIONS = [
     { k: 'letterSp', l: 'Harf Aralığı', v: 0.7, min: -1, max: 5, step: 0.05, show: show.text },
     { k: 'textR', l: 'Yazı Yarıçapı', h: 'harflerin iç kenarı', v: 10.6, min: 1, max: 100, step: 0.1, show: show.circ },
     { k: 'lineSp', l: 'Satır Aralığı', h: 'harf yüksekliğinin katı', v: 1.4, min: 1, max: 4, step: 0.05, show: show.flat, unit: '×' },
-    { k: 'align', l: 'Hizalama', v: 'center', type: 'select', opts: [['left', 'Sola'], ['center', 'Ortaya'], ['right', 'Sağa']], show: show.flat },
+    { k: 'textDir', l: 'Yazı yönü', v: 'ltr', type: 'select', opts: [['ltr', '→ Soldan sağa'], ['rtl', '← Sağdan sola'], ['ttb', '↓ Yukarıdan aşağıya'], ['btt', '↑ Aşağıdan yukarıya']], show: show.text,
+      h2: () => P.textMode === 'circle' ? 'dairesel mühürde: soldan sağa / sağdan sola' : (P.textDir === 'ttb' || P.textDir === 'btt') ? 'her satır bir sütun; harfler dik' : '' },
+    { k: 'align', l: 'Hizalama', v: 'center', type: 'select', opts: [['left', 'Sola / başa'], ['center', 'Ortaya'], ['right', 'Sağa / sona']], show: show.flat },
     { k: 'textDX', l: 'Yazı X Kaydırma', h: 'dairesel modda halkalar da kayar', v: 0, min: -100, max: 100, step: 0.25, show: show.text },
     { k: 'textDY', l: 'Yazı Y Kaydırma', v: 0, min: -100, max: 100, step: 0.25, show: show.text },
     { k: 'textRot', l: 'Yazı Açısı', h: 'dairesel modda yazı halka üzerinde döner', v: 0, min: -360, max: 360, step: 5, unit: '°', show: show.text },
@@ -1945,12 +1975,13 @@ function backPolys(font, str, maxW) {
   return flatText(font, str, capH, 0.2, 1.3, 'center', 0, 0).paths;
 }
 function prepTextData(font) {
-  const key = JSON.stringify([P.font, !!font, P.text, P.textMode, P.capH, P.letterSp, P.textR, P.lineSp, P.align, P.backOn, P.backLabel, P.backH, P.baseW, P.baseL]);
+  const key = JSON.stringify([P.font, !!font, P.text, P.textMode, P.textDir, P.capH, P.letterSp, P.textR, P.lineSp, P.align, P.backOn, P.backLabel, P.backH, P.baseW, P.baseL]);
   if (textData.key !== key) {
     let text = [];
     if (font && P.textMode !== 'none' && P.text.trim())
-      text = P.textMode === 'circle' ? circleText(font, P.text.split('\n'), P.capH, P.letterSp, P.textR)
-        : flatText(font, P.text, P.capH, P.letterSp, P.lineSp, P.align, 0, 0).paths;
+      text = P.textMode === 'circle'
+        ? circleText(font, P.text.split('\n').map(l => P.textDir === 'rtl' ? reverseLine(l) : l), P.capH, P.letterSp, P.textR)
+        : flatText(font, P.text, P.capH, P.letterSp, P.lineSp, P.align, 0, 0, false, P.textDir).paths;
     const maxW = Math.min(P.baseW, P.baseL) - 10;
     const lab = P.backLabel ? ' · ' + P.backLabel : '';
     const data = { text, backLower: P.backOn ? backPolys(font, 'ALT' + lab, maxW) : [], backUpper: P.backOn ? backPolys(font, 'ÜST' + lab, maxW) : [] };
